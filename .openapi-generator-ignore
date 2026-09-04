@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# openapi-generator が生成しないファイル
+# 手書き / プロジェクト管理ファイルを保護する
+.openapi-generator-ignore
+README.md
+.gitignore
+.travis.yml
+git_push.sh
+go.sum
+go.mod
+docs/**
+api/**
+test/**
+**/*_test.go
+
+# プロジェクト管理 / 生成設定ファイル（再生成で上書きしない）
+LICENSE
+NOTICE
+CHANGELOG.md
+.github/**
+Makefile
+CLAUDE.md
+README.md
+openapi.json
+openapi-generator-config.yaml
+
+# 手書きの追加実装（再生成で消さない）
+doc.go
+interfaces.go
+jobs_syncwait.go
+executeall_gen.go
+
+# 手書きの追加パッケージ・ツール・カスタムテンプレート
+utils/**
+misc/**
+tools/**
+templates/**

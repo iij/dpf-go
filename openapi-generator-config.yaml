@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+
+generatorName: go
+inputSpec: /local/openapi.json
+outputDir: /local
+templateDir: /local/templates
+
+# api_*.go / model_*.go をプロジェクト直下に出力する
+gitHost: github.com
+gitUserId: iij
+gitRepoId: dpf-go
+
+additionalProperties:
+  packageName: dpf
+  isGoSubmodule: false
+  generateInterfaces: false
+  enumClassPrefix: true
+  structPrefix: false
+  withGoMod: true
+
+# docs / test など補助ファイルは生成しない（api,model のみを直下に置く）
+globalProperties:
+  apiTests: "false"
+  modelTests: "false"
+  apiDocs: "false"
+  modelDocs: "false"

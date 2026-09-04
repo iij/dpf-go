@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Claude Code
+.claude
+
+# Go build artifacts / compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Test binaries / profiling / coverage output
+*.test
+*.out
+*.prof
+coverage.txt
+coverage.out
+*.cover
+
+# 依存をベンダリングしないため vendor は無視する
+/vendor/
+
+# Go workspace ファイル（ローカル開発用）
+go.work
+go.work.sum
+
+# 秘匿情報（DPF_API_TOKEN / DPF_API_ENDPOINT などを置く .env）
+.env
+.env.*
+!.env.example
+
+# エディタ / OS が生成するファイル
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

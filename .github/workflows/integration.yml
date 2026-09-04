@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 実際の DPF-API と権威 DNS サーバを使う統合テスト。
+#
+# テスト用ゾーンを共有するため、同時に 2 つ以上実行してはならない。
+# concurrency で直列化している。
+
+name: integration
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ワークフロー単位で直列化する。push と workflow_dispatch をまたいで
+# 1 つずつ実行されるようにするため、job ではなくここに置く。
+#
+# cancel-in-progress は必ず false にする。反映の途中でキャンセルすると
+# ゾーンに未反映の編集が残り、次の実行の前提が崩れる。
+concurrency:
+  group: dpf-integration-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    # fork が自身の main に push した場合に実行されないようにする。
+    # pull_request / pull_request_target は使っていないので、
+    # fork からの PR にシークレットが渡ることはない。
+    if: github.repository == 'iij/dpf-go'
+
+    runs-on: ubuntu-latest
+
+    # go test 側の -timeout 45m より長くする。Go が先に失敗すれば
+    # goroutine dump が残り、原因を追える。
+    timeout-minutes: 60
+
+    # 更新系トークンの適用範囲を絞る。
+    environment: integration
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check required secrets
+        env:
+          DPF_TOKEN_RO: ${{ secrets.DPF_TOKEN_RO }}
+          DPF_TOKEN_RW: ${{ secrets.DPF_TOKEN_RW }}
+          DPF_TEST_SERVICE_CODE: ${{ vars.DPF_TEST_SERVICE_CODE }}
+        run: |
+          # シークレット未設定時、テストは t.Skip で静かに飛ぶ。
+          # 「全部スキップ」が「全部成功」に見えないよう警告を残す。
+          missing=""
+          [ -z "$DPF_TOKEN_RO" ] && missing="$missing DPF_TOKEN_RO"
+          [ -z "$DPF_TOKEN_RW" ] && missing="$missing DPF_TOKEN_RW"
+          [ -z "$DPF_TEST_SERVICE_CODE" ] && missing="$missing DPF_TEST_SERVICE_CODE"
+          if [ -n "$missing" ]; then
+            echo "::warning::未設定のため一部またはすべての統合テストがスキップされる:$missing"
+            echo "> **注意**: 次が未設定のため統合テストはスキップされた:$missing" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "必要な設定はすべて揃っている" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run integration tests
+        env:
+          DPF_TOKEN_RO: ${{ secrets.DPF_TOKEN_RO }}
+          DPF_TOKEN_RW: ${{ secrets.DPF_TOKEN_RW }}
+          DPF_TEST_SERVICE_CODE: ${{ vars.DPF_TEST_SERVICE_CODE }}
+          DPF_API_ENDPOINT: ${{ vars.DPF_API_ENDPOINT }}
+          DPF_TEST_DNS_TIMEOUT: ${{ vars.DPF_TEST_DNS_TIMEOUT }}
+          # DPF_API_TOKEN は設定しない。utils.NewClient の既定の
+          # TokenProvider が参照するため、設定するとトークンの取り違えに気づけない。
+        run: make test-integration

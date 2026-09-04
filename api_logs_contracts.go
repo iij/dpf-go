@@ -1,0 +1,814 @@
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+DPF-APIリファレンスマニュアル
+
+# 1. はじめに  ## 1.1 DPF-APIについて IIJ DNSプラットフォームサービスでは、DNSレコードやゾーン情報などを、\\ お客様が用意したプログラムから自動的に操作するためのAPI機能を提供しています。\\ 以降、IIJ DNSプラットフォームサービスを「DPF」、DPFが提供するAPIを「DPF-API」あるいは単に「API」と表記します。\\ DPF-APIの利用には、DPFの契約とIIJ IDサービスの契約が必要となります。  本リファレンスマニュアルは[**OpenAPI**](https://www.openapis.org/)に準拠しています。  このWEBページはopenapi.jsonから自動生成しています。**このWEBページとopenapi.jsonの内容が異なる場合は、openapi.jsonの内容を正とします。** openapi.jsonは、上部のDownloadボタンからダウンロードできます。  ## 1.2 サポート範囲 DPF-APIを呼び出すためのプログラム、及びそのプログラムを稼働させるためのサーバは、お客様にてご用意ください。\\ お客様にご用意いただくプログラムの開発、利用、動作についてのお問い合わせは承ることができません。  以下の事項についてのお問い合わせは、弊社[**サポートセンター**](https://help.iij.ad.jp/)にて承ります。 - DPF-APIの挙動が本リファレンスマニュアルと異なる場合 - DPF-APIがシステムエラーを応答した場合  ## 1.3 参考資料 - IIJ DNSプラットフォームサービス オンラインマニュアル   - [https://manual.iij.jp/dpf/help/](https://manual.iij.jp/dpf/help/)  - IIJ IDサービス オンラインマニュアル   - [https://manual.iij.jp/iid/admin-help/](https://manual.iij.jp/iid/admin-help/)  # 2. 利用方法 DPF-APIは、URLとHTTPリクエストヘッダ、HTTPリクエストボディでパラメータを指定して利用します。\\ また、IIJ IDサービスのアクセストークンと管理対象の権限設定が必要です。  ## 2.1 リクエスト仕様  項目 | 規格 -----|----- プロトコル | HTTP/1.1（https） HTTPメソッド | GET、POST、PATCH、PUT、DELETE フォーマット | JSON 文字コード | UTF-8 タイムアウト | 300秒  - httpでのリクエストは受け付けません。必ずhttpsを使用してください。 - DPF-APIを呼び出すプログラムは、リクエスト先が正当なものであることを確認するため、SSL証明書を検証することを推奨します。 - 短期間に極めて多数のリクエストが行われた場合、サービスの健全性を保つためにリクエストを制限する場合があります。  ### アクセストークン APIリクエストの際にIIJ IDサービスによって発行されたアクセストークンをAuthorizationヘッダに指定する必要があります。\\ 各APIにより必要となるアクセス権の範囲（許可するスコープ）が異なるのでご注意ください。  各APIに表示されるAUTHORIZATIONSの `DPFViewer` / `DPFOperator` / `ContractOperator` は、HTTPヘッダ名ではなくそのAPIの実行に必要な権限を表す security scheme 名です。\\ 実際に送信するHTTPヘッダはすべて共通で `Authorization: Bearer <access_token>` です。  アクセストークン作成時に指定できる「許可するスコープ」は以下のとおりです。  許可するスコープ | 実行できるAPI -----------------|------------ dpf_read | 参照系API dpf_write | 更新系、及び参照系API dpf_contract | 契約系API  発行済のアクセストークンは、[**IIJ IDサービス**](https://www.auth.iij.jp/console/)の「アクセストークンの管理」より確認できます。\\ DPF-APIを利用する場合は「利用するリソースサーバ」の設定で「IIJ DNSサービスAPI」を選択してください。\\ アクセストークン管理方法のマニュアルは[**こちら**](https://manual.iij.jp/iid/admin-help/9054382.html)を参照してください。  ### 管理対象の権限設定 DPFでは、管理対象となる契約単位での参照、編集権限を細かく設定できます。\\ アクセストークンの許可するスコープが適切であっても、管理対象の権限が付与されていない場合はAPIを実行できません。\\ 管理対象の権限設定のマニュアルは[**こちら**](https://manual.iij.jp/dpf/help/19004706.html#IIJID%E3%82%B5%E3%83%BC%E3%83%93%E3%82%B9%E3%81%A8%E9%80%A3%E6%90%BA%E3%81%99%E3%82%8B-IIJID%E3%82%B5%E3%83%BC%E3%83%93%E3%82%B9%E3%82%A2%E3%82%AB%E3%82%A6%E3%83%B3%E3%83%88%E3%81%B8%E7%AE%A1%E7%90%86%E6%A8%A9%E9%99%90%E3%82%92%E4%BB%98%E4%B8%8E%E3%81%99%E3%82%8B)を参照してください。  ## 2.2 HTTPリクエスト  ### 例 ``` <HTTPメソッド> /dpf/<version>/<APIパス> HTTP/1.1 Host: api.dns-platform.jp Authorization: Bearer <access_token> Content-Type: application/json; charset=UTF-8  <HTTPリクエストボディ: JSON形式のAPI固有のパラメータ> ```  ### リクエストパラメータ DPF-APIで指定するパラメータは以下のとおりです。\\ リクエストパラメータに同一のキーが含まれる場合の動作は保証されません。  共通 | 指定箇所 | パラメータ | 意味 -----|----------|------------|----- 共通 | HTTPメソッド | HTTPメソッド | HTTPメソッド（値：GET、POST、PATCH、PUT、DELETE） 共通 | URL | version | DPF-APIバージョン（値：v1） 個別 | URL | APIパス | API名称やAPI個別のパラメータの組み合わせ 共通 | HTTPヘッダー | access_token | IIJ IDアクセストークン（参照：[**IIJ IDサービス**](https://www.auth.iij.jp/console/)） 個別 | HTTPボディ | APIごとに異なる | JSON形式のパラメータ  <a id=\"http-response\"></a>  ## 2.3 HTTPレスポンス  ### 成功レスポンス APIごとにレスポンスが異なります。  ### エラーレスポンス HTTPステータスコード、及びレスポンスボディによってクライアントプログラムにエラーを通知します。  #### 例：アクセストークンが誤っている ``` {   \"request_id\": \"782d746ac3cb46499b31708fa80e8660\",   \"error_type\": \"ParameterError\",   \"error_message\": \"There are invalid parameters.\",   \"error_details\": [     {       \"code\": \"invalid\",       \"attribute\": \"access_token\"     }   ] } ```  #### エラーコード一覧 HTTP Status Code | error_type | error_message | code | attribute | block_id | 説明 | 対処方法 -----------------|------------|---------------|------|-----------|----------|------|--------- 400 | ParameterError | There are invalid parameters. | invalid | access_token | - | 指定したアクセストークンに誤りがあります | アクセストークンを確認してください 400 | ParameterError | JSON parse error occurred. | - | - | - | パラメータとして不正なJSON文字列が指定されました | リクエストのパラメータを確認してください 400 | ParameterError | There are invalid parameters. | （API個別） | （API個別） | - | 不正なパラメータが指定されました | 各APIのエラーコードを確認してください 404 | NotFound | Specified resource not found. | - | - | - | アクセスURLが正しくありません <br> 存在しないAPIが指定されました <br> 指定された以外のHTTPメソッドが指定されました | 左記の内容を確認してください 406 | NotAcceptable | Request was blocked. | - | - | {id} | セキュリティ制御によりリクエストがブロックされました | block_idを添えてサポートセンターにお問い合わせください 429 | TooManyRequests | Too many requests. | - | - | - | 大量のAPIリクエストが送信されました | 単位時間当たりのAPIリクエスト数が多いため、リクエスト数を抑えてください 500 | SystemError | System error occurred. | - | - | - | システム障害が発生しました | [**サポートセンター**](https://help.iij.ad.jp/)へお問い合わせください<br>お問い合わせの際にリクエストの詳細時間及びrequest_idをお伝えください 503 | ServiceUnavailable | Service unavailable. | - | - | - | メンテナンス中もしくはアクセスが集中しています | しばらく待ってから再度リクエストしてください<br>メンテナンス内容についてはサービスオンラインでご確認ください 503 | SystemBusy | The system is busy, Please try again later. | - | - | - | システムが混み合っています | しばらく待ってから再度リクエストしてください 504 | GatewayTimeout | Gateway timeout. | - | - | - | リクエストがタイムアウトしました | しばらく待ってから再度リクエストしてください  ## 2.4 非同期リクエスト  DPF-APIにおけるGET以外のAPIは全て非同期APIです。\\ 非同期APIはリクエストを受け付けると即座にレスポンスを返却しますが、\\ リクエストに対する実際の処理は非同期で行われます。  非同期リクエストの受け付けに成功した場合のHTTPステータスコードは202で、\\ 返却されたレスポンスボディには、処理進捗を確認するためのURL（jobs_url）が含まれます。\\ このjobs_urlに対してGETリクエストをすることで進捗状況を確認できます。  進捗状況を確認した際、非同期処理が正常に終了していた場合は、\\ 返却されたレスポンスボディには、対象リソースを取得するためのURL（resources_url）が含まれます。\\ このresources_urlに対してGETリクエストをすることで実行結果を確認できます。  ### 例 #### 非同期リクエストのレスポンス ``` HTTP/1.1 202 Accepted Date: Mon, 26 Mar 20XX hh:mm:dd GMT Content-Type: application/json; charset=utf-8 〜 略 〜  {   \"request_id\": \"782d746ac3cb46499b31708fa80e8660\",   \"jobs_url\": \"https://api.dns-platform.jp/dpf/<version>/jobs/<request_id>\" } ```  #### GETリクエスト ``` GET /dpf/<version>/jobs/<request_id> HTTP/1.1 Host: api.dns-platform.jp Authorization: Bearer <access_token> Content-Type: application/json; charset=UTF-8  {} ```  #### 進捗状況のレスポンス ``` HTTP/1.1 200 OK Date: Mon, 26 Mar 202X hh:mm:dd GMT Content-Type: application/json; charset=utf-8 〜 略 〜  {   \"request_id\": \"782d746ac3cb46499b31708fa80e8660\",   \"resources_url\": <resources_url>,   \"status\": \"SUCCESSFUL\" } ```  # 3. リリースノート  ## 3.1 バージョン 1.0.0 - APIをリリースしました。  ## 3.2 バージョン 2.0.0 - 対応プロトコルから HTTP/2 を削除しました。  ## 3.3 バージョン 3.7.0 - セキュリティ制御でリクエストがブロックされた場合に HTTP Status 406 がレスポンスされます。レスポンス形式は **[2.3 HTTPレスポンス](#http-response)** を参照してください。 - エラーレスポンス定義に関する軽微な不具合を修正しました。
+
+API version: 3.7.0
+*/
+
+// Code generated by OpenAPI Generator (https://openapi-generator.tech); DO NOT EDIT.
+
+package dpf
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+)
+
+// LogsContractsAPIService LogsContractsAPI service
+type LogsContractsAPIService service
+
+type ApiGetContractsLogListRequest struct {
+	ctx               context.Context
+	ApiService        *LogsContractsAPIService
+	contractId        string
+	type_             *SearchType
+	offset            *int32
+	limit             *int32
+	startDate         *string
+	endDate           *string
+	timeZone          *string
+	order             *SearchOrder
+	keywordsFullText  *[]string
+	keywordsLogType   *ContractsLogsLogType
+	keywordsOperator  *[]string
+	keywordsOperation *ContractsLogsOperation
+	keywordsTarget    *[]string
+	keywordsDetail    *[]string
+	keywordsRequestId *[]string
+	keywordsStatus    *ContractsLogsStatus
+}
+
+func (r ApiGetContractsLogListRequest) Type_(type_ SearchType) ApiGetContractsLogListRequest {
+	r.type_ = &type_
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) Offset(offset int32) ApiGetContractsLogListRequest {
+	r.offset = &offset
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) Limit(limit int32) ApiGetContractsLogListRequest {
+	r.limit = &limit
+	return r
+}
+
+// 開始日
+func (r ApiGetContractsLogListRequest) StartDate(startDate string) ApiGetContractsLogListRequest {
+	r.startDate = &startDate
+	return r
+}
+
+// 終了日
+func (r ApiGetContractsLogListRequest) EndDate(endDate string) ApiGetContractsLogListRequest {
+	r.endDate = &endDate
+	return r
+}
+
+// タイムゾーン
+func (r ApiGetContractsLogListRequest) TimeZone(timeZone string) ApiGetContractsLogListRequest {
+	r.timeZone = &timeZone
+	return r
+}
+
+// ソート順
+func (r ApiGetContractsLogListRequest) Order(order SearchOrder) ApiGetContractsLogListRequest {
+	r.order = &order
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsFullText(keywordsFullText []string) ApiGetContractsLogListRequest {
+	r.keywordsFullText = &keywordsFullText
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsLogType(keywordsLogType ContractsLogsLogType) ApiGetContractsLogListRequest {
+	r.keywordsLogType = &keywordsLogType
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsOperator(keywordsOperator []string) ApiGetContractsLogListRequest {
+	r.keywordsOperator = &keywordsOperator
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsOperation(keywordsOperation ContractsLogsOperation) ApiGetContractsLogListRequest {
+	r.keywordsOperation = &keywordsOperation
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsTarget(keywordsTarget []string) ApiGetContractsLogListRequest {
+	r.keywordsTarget = &keywordsTarget
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsDetail(keywordsDetail []string) ApiGetContractsLogListRequest {
+	r.keywordsDetail = &keywordsDetail
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsRequestId(keywordsRequestId []string) ApiGetContractsLogListRequest {
+	r.keywordsRequestId = &keywordsRequestId
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) KeywordsStatus(keywordsStatus ContractsLogsStatus) ApiGetContractsLogListRequest {
+	r.keywordsStatus = &keywordsStatus
+	return r
+}
+
+func (r ApiGetContractsLogListRequest) Execute() (*GetContractsLogs, *http.Response, error) {
+	return r.ApiService.GetContractsLogListExecute(r)
+}
+
+/*
+GetContractsLogList DPF契約操作ログの一覧取得
+
+DPF契約を操作したログの一覧を取得します。\
+"_keywords" から始まるパラメータは、合計で30個まで指定可能です。
+
+	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+	@param contractId ID
+	@return ApiGetContractsLogListRequest
+*/
+func (a *LogsContractsAPIService) GetContractsLogList(ctx context.Context, contractId string) ApiGetContractsLogListRequest {
+	return ApiGetContractsLogListRequest{
+		ApiService: a,
+		ctx:        ctx,
+		contractId: contractId,
+	}
+}
+
+// Execute executes the request
+//
+//	@return GetContractsLogs
+func (a *LogsContractsAPIService) GetContractsLogListExecute(r ApiGetContractsLogListRequest) (*GetContractsLogs, *http.Response, error) {
+	var (
+		localVarHTTPMethod  = http.MethodGet
+		localVarPostBody    interface{}
+		formFiles           []formFile
+		localVarReturnValue *GetContractsLogs
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "LogsContractsAPIService.GetContractsLogList")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/contracts/{ContractId}/logs"
+	localVarPath = strings.Replace(localVarPath, "{"+"ContractId"+"}", url.PathEscape(parameterValueToString(r.contractId, "contractId")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if strlen(r.contractId) < 14 {
+		return localVarReturnValue, nil, reportError("contractId must have at least 14 elements")
+	}
+	if strlen(r.contractId) > 14 {
+		return localVarReturnValue, nil, reportError("contractId must have less than 14 elements")
+	}
+
+	if r.type_ != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "type", r.type_, "form", "")
+	} else {
+		var defaultValue SearchType = "AND"
+		parameterAddToHeaderOrQuery(localVarQueryParams, "type", defaultValue, "form", "")
+		r.type_ = &defaultValue
+	}
+	if r.offset != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "offset", r.offset, "form", "")
+	} else {
+		var defaultValue int32 = 0
+		parameterAddToHeaderOrQuery(localVarQueryParams, "offset", defaultValue, "form", "")
+		r.offset = &defaultValue
+	}
+	if r.limit != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "limit", r.limit, "form", "")
+	} else {
+		var defaultValue int32 = 100
+		parameterAddToHeaderOrQuery(localVarQueryParams, "limit", defaultValue, "form", "")
+		r.limit = &defaultValue
+	}
+	if r.startDate != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "start_date", r.startDate, "form", "")
+	} else {
+		var defaultValue string = ""
+		parameterAddToHeaderOrQuery(localVarQueryParams, "start_date", defaultValue, "form", "")
+		r.startDate = &defaultValue
+	}
+	if r.endDate != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "end_date", r.endDate, "form", "")
+	} else {
+		var defaultValue string = ""
+		parameterAddToHeaderOrQuery(localVarQueryParams, "end_date", defaultValue, "form", "")
+		r.endDate = &defaultValue
+	}
+	if r.timeZone != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "time_zone", r.timeZone, "form", "")
+	} else {
+		var defaultValue string = "+00:00"
+		parameterAddToHeaderOrQuery(localVarQueryParams, "time_zone", defaultValue, "form", "")
+		r.timeZone = &defaultValue
+	}
+	if r.order != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "order", r.order, "form", "")
+	} else {
+		var defaultValue SearchOrder = "ASC"
+		parameterAddToHeaderOrQuery(localVarQueryParams, "order", defaultValue, "form", "")
+		r.order = &defaultValue
+	}
+	if r.keywordsFullText != nil {
+		t := *r.keywordsFullText
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", defaultValue, "form", "multi")
+		r.keywordsFullText = &defaultValue
+	}
+	if r.keywordsLogType != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_log_type[]", r.keywordsLogType, "form", "")
+	}
+	if r.keywordsOperator != nil {
+		t := *r.keywordsOperator
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", defaultValue, "form", "multi")
+		r.keywordsOperator = &defaultValue
+	}
+	if r.keywordsOperation != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operation[]", r.keywordsOperation, "form", "")
+	}
+	if r.keywordsTarget != nil {
+		t := *r.keywordsTarget
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", defaultValue, "form", "multi")
+		r.keywordsTarget = &defaultValue
+	}
+	if r.keywordsDetail != nil {
+		t := *r.keywordsDetail
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", defaultValue, "form", "multi")
+		r.keywordsDetail = &defaultValue
+	}
+	if r.keywordsRequestId != nil {
+		t := *r.keywordsRequestId
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", defaultValue, "form", "multi")
+		r.keywordsRequestId = &defaultValue
+	}
+	if r.keywordsStatus != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_status[]", r.keywordsStatus, "form", "")
+	}
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		if localVarHTTPResponse.StatusCode == 400 {
+			var v ParameterErrorResponse
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 404 {
+			var v NotFoundError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 406 {
+			var v NotAcceptableError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 429 {
+			var v TooManyRequestsError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 500 {
+			var v SystemError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 503 {
+			var v ServiceUnavailableOrBusyErrorResponse
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 504 {
+			var v GatewayTimeoutError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiGetContractsLogListCountRequest struct {
+	ctx               context.Context
+	ApiService        *LogsContractsAPIService
+	contractId        string
+	type_             *SearchType
+	startDate         *string
+	endDate           *string
+	timeZone          *string
+	keywordsFullText  *[]string
+	keywordsLogType   *ContractsLogsLogType
+	keywordsOperator  *[]string
+	keywordsOperation *ContractsLogsOperation
+	keywordsTarget    *[]string
+	keywordsDetail    *[]string
+	keywordsRequestId *[]string
+	keywordsStatus    *ContractsLogsStatus
+}
+
+func (r ApiGetContractsLogListCountRequest) Type_(type_ SearchType) ApiGetContractsLogListCountRequest {
+	r.type_ = &type_
+	return r
+}
+
+// 開始日
+func (r ApiGetContractsLogListCountRequest) StartDate(startDate string) ApiGetContractsLogListCountRequest {
+	r.startDate = &startDate
+	return r
+}
+
+// 終了日
+func (r ApiGetContractsLogListCountRequest) EndDate(endDate string) ApiGetContractsLogListCountRequest {
+	r.endDate = &endDate
+	return r
+}
+
+// タイムゾーン
+func (r ApiGetContractsLogListCountRequest) TimeZone(timeZone string) ApiGetContractsLogListCountRequest {
+	r.timeZone = &timeZone
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsFullText(keywordsFullText []string) ApiGetContractsLogListCountRequest {
+	r.keywordsFullText = &keywordsFullText
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsLogType(keywordsLogType ContractsLogsLogType) ApiGetContractsLogListCountRequest {
+	r.keywordsLogType = &keywordsLogType
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsOperator(keywordsOperator []string) ApiGetContractsLogListCountRequest {
+	r.keywordsOperator = &keywordsOperator
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsOperation(keywordsOperation ContractsLogsOperation) ApiGetContractsLogListCountRequest {
+	r.keywordsOperation = &keywordsOperation
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsTarget(keywordsTarget []string) ApiGetContractsLogListCountRequest {
+	r.keywordsTarget = &keywordsTarget
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsDetail(keywordsDetail []string) ApiGetContractsLogListCountRequest {
+	r.keywordsDetail = &keywordsDetail
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsRequestId(keywordsRequestId []string) ApiGetContractsLogListCountRequest {
+	r.keywordsRequestId = &keywordsRequestId
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) KeywordsStatus(keywordsStatus ContractsLogsStatus) ApiGetContractsLogListCountRequest {
+	r.keywordsStatus = &keywordsStatus
+	return r
+}
+
+func (r ApiGetContractsLogListCountRequest) Execute() (*GetCount, *http.Response, error) {
+	return r.ApiService.GetContractsLogListCountExecute(r)
+}
+
+/*
+GetContractsLogListCount DPF契約操作ログの件数取得
+
+DPF契約を操作したログの件数を取得します。\
+"_keywords" から始まるパラメータは、合計で30個まで指定可能です。
+
+	@param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+	@param contractId ID
+	@return ApiGetContractsLogListCountRequest
+*/
+func (a *LogsContractsAPIService) GetContractsLogListCount(ctx context.Context, contractId string) ApiGetContractsLogListCountRequest {
+	return ApiGetContractsLogListCountRequest{
+		ApiService: a,
+		ctx:        ctx,
+		contractId: contractId,
+	}
+}
+
+// Execute executes the request
+//
+//	@return GetCount
+func (a *LogsContractsAPIService) GetContractsLogListCountExecute(r ApiGetContractsLogListCountRequest) (*GetCount, *http.Response, error) {
+	var (
+		localVarHTTPMethod  = http.MethodGet
+		localVarPostBody    interface{}
+		formFiles           []formFile
+		localVarReturnValue *GetCount
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "LogsContractsAPIService.GetContractsLogListCount")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/contracts/{ContractId}/logs/count"
+	localVarPath = strings.Replace(localVarPath, "{"+"ContractId"+"}", url.PathEscape(parameterValueToString(r.contractId, "contractId")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if strlen(r.contractId) < 14 {
+		return localVarReturnValue, nil, reportError("contractId must have at least 14 elements")
+	}
+	if strlen(r.contractId) > 14 {
+		return localVarReturnValue, nil, reportError("contractId must have less than 14 elements")
+	}
+
+	if r.type_ != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "type", r.type_, "form", "")
+	} else {
+		var defaultValue SearchType = "AND"
+		parameterAddToHeaderOrQuery(localVarQueryParams, "type", defaultValue, "form", "")
+		r.type_ = &defaultValue
+	}
+	if r.startDate != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "start_date", r.startDate, "form", "")
+	} else {
+		var defaultValue string = ""
+		parameterAddToHeaderOrQuery(localVarQueryParams, "start_date", defaultValue, "form", "")
+		r.startDate = &defaultValue
+	}
+	if r.endDate != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "end_date", r.endDate, "form", "")
+	} else {
+		var defaultValue string = ""
+		parameterAddToHeaderOrQuery(localVarQueryParams, "end_date", defaultValue, "form", "")
+		r.endDate = &defaultValue
+	}
+	if r.timeZone != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "time_zone", r.timeZone, "form", "")
+	} else {
+		var defaultValue string = "+00:00"
+		parameterAddToHeaderOrQuery(localVarQueryParams, "time_zone", defaultValue, "form", "")
+		r.timeZone = &defaultValue
+	}
+	if r.keywordsFullText != nil {
+		t := *r.keywordsFullText
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_full_text[]", defaultValue, "form", "multi")
+		r.keywordsFullText = &defaultValue
+	}
+	if r.keywordsLogType != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_log_type[]", r.keywordsLogType, "form", "")
+	}
+	if r.keywordsOperator != nil {
+		t := *r.keywordsOperator
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operator[]", defaultValue, "form", "multi")
+		r.keywordsOperator = &defaultValue
+	}
+	if r.keywordsOperation != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_operation[]", r.keywordsOperation, "form", "")
+	}
+	if r.keywordsTarget != nil {
+		t := *r.keywordsTarget
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_target[]", defaultValue, "form", "multi")
+		r.keywordsTarget = &defaultValue
+	}
+	if r.keywordsDetail != nil {
+		t := *r.keywordsDetail
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_detail[]", defaultValue, "form", "multi")
+		r.keywordsDetail = &defaultValue
+	}
+	if r.keywordsRequestId != nil {
+		t := *r.keywordsRequestId
+		if reflect.TypeOf(t).Kind() == reflect.Slice {
+			s := reflect.ValueOf(t)
+			for i := 0; i < s.Len(); i++ {
+				parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", s.Index(i).Interface(), "form", "multi")
+			}
+		} else {
+			parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", t, "form", "multi")
+		}
+	} else {
+		var defaultValue []string = []string{}
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_request_id[]", defaultValue, "form", "multi")
+		r.keywordsRequestId = &defaultValue
+	}
+	if r.keywordsStatus != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "_keywords_status[]", r.keywordsStatus, "form", "")
+	}
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		if localVarHTTPResponse.StatusCode == 400 {
+			var v ParameterErrorResponse
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 404 {
+			var v NotFoundError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 406 {
+			var v NotAcceptableError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 429 {
+			var v TooManyRequestsError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 500 {
+			var v SystemError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 503 {
+			var v ServiceUnavailableOrBusyErrorResponse
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+			return localVarReturnValue, localVarHTTPResponse, newErr
+		}
+		if localVarHTTPResponse.StatusCode == 504 {
+			var v GatewayTimeoutError
+			err = a.client.decode(&v, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+			if err != nil {
+				newErr.error = err.Error()
+				return localVarReturnValue, localVarHTTPResponse, newErr
+			}
+			newErr.error = formatErrorMessage(localVarHTTPResponse.Status, &v)
+			newErr.model = v
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
