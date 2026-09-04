@@ -7,7 +7,7 @@ DOCKER_RUN := docker run --rm -u $(shell id -u):$(shell id -g) -v "$(CURDIR):/lo
 # optional な機能で、それぞれ独立した go.mod を持つ。
 MODULES := . misc/vault misc/aws misc/azure misc/gcp
 
-.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration lint tidy-all
+.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration lint gitleaks tidy-all
 
 all: generate
 
@@ -81,6 +81,14 @@ lint:
 		echo "==> $$m"; \
 		(cd $$m && golangci-lint run --build-tags=integration ./...) || exit 1; \
 	done
+
+# シークレットの混入を検査する（履歴と作業ツリーの両方）。
+#
+# --redact を付けて、検出した値そのものが端末やログに残らないようにする。
+# 誤検知の除外は .gitleaks.toml に定義する。理由を書かずに除外しないこと。
+gitleaks:
+	gitleaks git . --redact --no-banner --exit-code 1
+	gitleaks dir . --redact --no-banner --exit-code 1
 
 # 全モジュールの go.mod / go.sum を整理する。
 tidy-all:

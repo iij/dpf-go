@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# シークレットの混入検査。
+#
+# 公式の gitleaks-action は組織アカウントのリポジトリでは有償ライセンス
+# (GITLEAKS_LICENSE) が必要なため、リリースのバイナリを直接使う。
+
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GITLEAKS_VERSION: 8.30.1
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 履歴全体を走査するため、浅いクローンにしない。
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      # --redact を必ず付ける。付けないと検出したシークレットが
+      # そのまま CI のログに残り、被害を広げてしまう。
+      - name: Scan git history
+        run: gitleaks git . --redact --no-banner --exit-code 1
+
+      - name: Scan working tree
+        run: gitleaks dir . --redact --no-banner --exit-code 1

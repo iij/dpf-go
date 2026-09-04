@@ -98,8 +98,12 @@ DPF-API 自体の仕様は [DPF-API リファレンスマニュアル](https://m
 make build-all   # 全モジュールのビルド
 make test        # 全モジュールの単体テスト（ネットワーク不要）
 make lint        # golangci-lint
+make gitleaks    # シークレットの混入検査（履歴と作業ツリー）
 make generate    # openapi.json から api/model を再生成（Docker が必要）
 ```
+
+シークレット検査の誤検知の除外は [.gitleaks.toml](.gitleaks.toml) に定義しています。
+除外を追加する場合は、なぜシークレットでないのかを `description` に必ず記載してください。
 
 実際の DPF-API と権威 DNS サーバを使う統合テストは、`integration` ビルドタグで
 隔離しており `make test` では実行されない。実行方法と必要な環境変数は

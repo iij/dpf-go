@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# gitleaks の設定。
+#
+# 既定のルールセットをそのまま使い、誤検知の除外だけを定義する。
+# 除外を追加する場合は、なぜシークレットでないのかを description に必ず書くこと。
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """\
+DPF-API の仕様ファイル。TSIG の secret など例示値を含む。\
+上流が公開している仕様を丸ごと取り込んでおり、make generate で全体が置き換わる。\
+"""
+paths = ['''^openapi\.json$''']
+
+[[allowlists]]
+description = """\
+openapi-generator のテンプレート。go.sum のモジュールハッシュを含む。\
+"""
+paths = ['''^templates/''']
+
+[[allowlists]]
+description = """\
+Go モジュールのハッシュ(go.sum の h1: 形式)。base64 だがシークレットではない。\
+"""
+regexes = ['''h1:[A-Za-z0-9+/]{43}=''']
+
+[[allowlists]]
+description = """\
+godoc の実行例で使うダミーのゾーンID。\
+"""
+regexes = ['''zone-id-123456''']
