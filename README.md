@@ -95,14 +95,43 @@ DPF-API 自体の仕様は [DPF-API リファレンスマニュアル](https://m
 ## 開発
 
 ```bash
-make build-all   # 全モジュールのビルド
-make test        # 全モジュールの単体テスト（ネットワーク不要）
-make lint        # golangci-lint
-make gitleaks    # シークレットの混入検査（履歴と作業ツリー）
-make generate    # openapi.json から api/model を再生成（Docker が必要）
+make install-hooks # git hook を有効化する（clone 直後に一度）
+make build-all     # 全モジュールのビルド
+make test          # 全モジュールの単体テスト（ネットワーク不要）
+make lint          # golangci-lint
+make gitleaks      # シークレットの混入検査（履歴と作業ツリー）
+make generate      # openapi.json から api/model を再生成（Docker が必要）
 ```
 
-シークレット検査の誤検知の除外は [.gitleaks.toml](.gitleaks.toml) に定義しています。
+### シークレットの混入検査
+
+[gitleaks](https://github.com/gitleaks/gitleaks) で三段構えに検査しています。
+
+| 段 | 実体 | 走査対象 |
+|---|---|---|
+| コミット時 | [.githooks/pre-commit](.githooks/pre-commit) | ステージした変更 |
+| push 時 | [.githooks/pre-push](.githooks/pre-push) | リモートにまだ無いコミットの履歴 |
+| CI | [.github/workflows/gitleaks.yml](.github/workflows/gitleaks.yml) | 履歴全体と作業ツリー |
+
+git は clone で hook を持ってこないため、clone 直後に一度だけ有効化してください。
+`core.hooksPath` をリポジトリ管理の `.githooks/` に向けます（グローバルの
+`core.hooksPath` より優先されます。戻すには `make uninstall-hooks`）。
+
+```bash
+make install-hooks
+```
+
+hook は最後の砦なので、gitleaks が入っていなければ検査せず通すのではなく
+中断します。急ぎで飛ばす必要があれば `git commit --no-verify` /
+`git push --no-verify` を使えますが、その場合も CI で必ず検査されます。
+`main` へのマージには CI の `gitleaks` の成功が必須です。
+
+CI が落ちた場合は、手元で `make gitleaks` を実行して内容を確認してください。
+
+検出されたものが本物だった場合は、**まずトークンを失効・再発行してください**。
+履歴から消しても、一度 push された値は漏洩したものとして扱う必要があります。
+
+誤検知の除外は [.gitleaks.toml](.gitleaks.toml) に定義しています。
 除外を追加する場合は、なぜシークレットでないのかを `description` に必ず記載してください。
 
 実際の DPF-API と権威 DNS サーバを使う統合テストは、`integration` ビルドタグで
