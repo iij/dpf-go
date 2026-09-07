@@ -1,0 +1,64 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# push 前に、これから push するコミットの履歴をシークレット検査する。
+#
+# 有効化:   make install-hooks
+# 無効化:   make uninstall-hooks
+# 一時回避: git push --no-verify
+#
+# pre-commit はステージ内容しか見ず、--no-verify でも飛ばせる。rebase や
+# cherry-pick で持ち込んだコミットも hook を通らない。公開前の最後の砦
+# として、リモートにまだ無いコミットの範囲をまとめて走査する。
+
+set -eu
+
+# git が hook に渡す引数: $1 = push 先の remote 名（または URL）、$2 = URL。
+remote_name="${1:-origin}"
+
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+	cat >&2 <<'EOF'
+gitleaks が見つからないため、シークレット検査ができない。
+検査せずに公開すると取り返しがつかないので、push を中断する。
+
+  導入: https://github.com/gitleaks/gitleaks#installing
+        （CI と同じ v8 系を使うこと。make gitleaks で同じ検査が走る）
+  回避: git push --no-verify
+EOF
+	exit 1
+fi
+
+# stdin には push する ref ごとに 1 行、
+# "<local ref> <local sha> <remote ref> <remote sha>" が渡る。
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+	# SHA がすべて 0 なら「存在しない」を意味する。SHA-1 と SHA-256 で
+	# 桁数が違うため、桁数ではなく 0 以外の文字を含むかで判定する。
+	case "$local_sha" in
+	*[!0]*) ;;
+	# local が空 = ref の削除。走査する対象が無い。
+	*) continue ;;
+	esac
+
+	case "$remote_sha" in
+	*[!0]*)
+		# 既存の ref への push。増える分のコミットだけを走査する。
+		log_opts="$remote_sha..$local_sha"
+		;;
+	*)
+		# 新規の ref。この remote に既にあるコミットを除いて走査する。
+		# remote 名ではなく URL を直接指定された場合は名前で絞れないため、
+		# 全 remote の追跡ブランチを除外対象にする。
+		if git remote get-url "$remote_name" >/dev/null 2>&1; then
+			log_opts="$local_sha --not --remotes=$remote_name"
+		else
+			log_opts="$local_sha --not --remotes"
+		fi
+		;;
+	esac
+
+	# --log-opts の内容はそのまま git log に渡される。
+	# --redact と --verbose の理由は pre-commit と同じ。
+	gitleaks git . --redact --verbose --no-banner --exit-code 1 --log-opts="$log_opts"
+done

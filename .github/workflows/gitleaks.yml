@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# シークレットの混入検査。
+#
+# 公式の gitleaks-action は組織アカウントのリポジトリでは有償ライセンス
+# (GITLEAKS_LICENSE) が必要なため、リリースのバイナリを直接使う。
+
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GITLEAKS_VERSION: 8.30.1
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 履歴全体を走査するため、浅いクローンにしない。
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          curl -sSfL \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      # --redact を必ず付ける。付けないと検出したシークレットが
+      # そのまま CI のログに残り、被害を広げてしまう。
+      #
+      # --verbose は付けない。--redact で値は隠れても、ファイル・行・
+      # ルール ID・エントロピー・前後の文脈までは出る。検出箇所の確認は
+      # 手元の make gitleaks で行う。
+      - name: Scan git history
+        run: gitleaks git . --redact --no-banner --exit-code 1
+
+      - name: Scan working tree
+        run: gitleaks dir . --redact --no-banner --exit-code 1
+
+      - name: How to investigate
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          シークレットの疑いが検出された。手元で次を実行して内容を確認すること。
+
+          ```
+          make gitleaks
+          ```
+
+          - 本物だった場合: **まず失効・再発行する**。履歴からの削除だけでは漏洩は止まらない。
+          - 誤検知だった場合: `.gitleaks.toml` に除外を追加し、なぜシークレットでないのかを `description` に書く。
+          EOF
+
+      # 実行ビットの無い hook は git に黙って無視される。壊れた hook を
+      # 「動いているつもり」で使い続けないよう、構文と一緒に検査する。
+      - name: Check git hooks are runnable
+        run: |
+          status=0
+          for hook in .githooks/*; do
+            if [ ! -x "$hook" ]; then
+              echo "::error file=$hook::実行ビットが無く、git に無視される。chmod +x すること"
+              status=1
+            fi
+            sh -n "$hook" || status=1
+          done
+          exit $status

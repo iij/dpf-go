@@ -7,7 +7,7 @@ DOCKER_RUN := docker run --rm -u $(shell id -u):$(shell id -g) -v "$(CURDIR):/lo
 # optional な機能で、それぞれ独立した go.mod を持つ。
 MODULES := . misc/vault misc/aws misc/azure misc/gcp
 
-.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration lint tidy-all
+.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration lint gitleaks install-hooks uninstall-hooks tidy-all
 
 all: generate
 
@@ -81,6 +81,34 @@ lint:
 		echo "==> $$m"; \
 		(cd $$m && golangci-lint run --build-tags=integration ./...) || exit 1; \
 	done
+
+# シークレットの混入を検査する（履歴と作業ツリーの両方）。
+#
+# --redact を付けて、検出した値そのものが端末やログに残らないようにする。
+# --verbose が無いと「leaks found: N」しか出ず、場所が分からない。
+# 手元での実行なので詳細を出す（CI では付けない。CI が落ちた時の内容確認は
+# このターゲットで行う）。
+# 誤検知の除外は .gitleaks.toml に定義する。理由を書かずに除外しないこと。
+gitleaks:
+	gitleaks git . --redact --verbose --no-banner --exit-code 1
+	gitleaks dir . --redact --verbose --no-banner --exit-code 1
+
+# .githooks/ の git hook を有効化する（clone 直後に一度実行する）。
+#
+# git は clone で hook を持ってこないため、リポジトリ管理の .githooks を
+# core.hooksPath に向ける形で有効化する。パスは相対のまま設定する。
+# 絶対パスにすると、リポジトリを別の場所へ移した時点で hook が動かなくなる。
+#
+# 【注意】core.hooksPath はグローバル設定より優先される。グローバルの
+# core.hooksPath に独自の hook を置いている場合、このリポジトリでは
+# それらが動かなくなる。必要なら .githooks/ 側に移すこと。
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "core.hooksPath = $$(git config core.hooksPath)"
+	@ls -l .githooks
+
+uninstall-hooks:
+	git config --unset core.hooksPath
 
 # 全モジュールの go.mod / go.sum を整理する。
 tidy-all:
