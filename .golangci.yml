@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 静的解析と整形の設定。
+#
+# 手元と統合前の検査が同一の設定・同一の版で動くことが要件である。
+# golangci-lint の版は Makefile の GOLANGCI_LINT_VERSION が唯一の出典で、
+# CI は自前で版を持たない。両者に版があると必ず乖離し、指摘が「環境の差」
+# として扱われてツールの判断が信頼されなくなる。
+#
+# 本ファイルは手書きであり .openapi-generator-ignore に登録している。
+
+version: "2"
+
+linters:
+  # 有効な linter を明示する。既定のセットに任せると、golangci-lint の
+  # 版が上がったときに指摘の集合が黙って変わる。
+  default: standard
+  enable:
+    # 抑制そのものの書き方を検査する。理由の記載と対象 linter の明示を
+    # 求める。範囲の広さ（package 宣言より前の nolint）は nolintlint では
+    # 防げないため、make check-headers が担当する。
+    - nolintlint
+
+  settings:
+    nolintlint:
+      # 理由を書かない抑制を認めない。抑制の妥当性は機械的に判定できないが、
+      # 理由の有無は判定できる。内容の妥当性はレビューが見る。
+      require-explanation: true
+      # 対象 linter を明示しない抑制（//nolint 単体）を認めない。
+      # 何を止めているのか分からない抑制は、後から範囲を確認できない。
+      require-specific: true
+      # 効いていない抑制を残さない。対応済みの指摘に対する抑制が残ると、
+      # 次に同じ指摘が出たときに黙って通る。
+      allow-unused: false
+
+  exclusions:
+    rules:
+      # 生成物は直接編集できない（憲章 原則 I）。指摘が出た場合の対処は
+      # templates/ の修正であり、ここで除外するのは「生成物に対して
+      # 手を入れられない」ことの反映である。
+      - path: '^(api_|model_)[^/]*\.go$'
+        linters:
+          - nolintlint
+      - path: '^(client|configuration|response|utils|executeall_gen)\.go$'
+        linters:
+          - nolintlint
+
+formatters:
+  # 2.13 系では gofmt は linter ではなく formatter に属する。
+  # make check-lint は検査のみを行い、ファイルを書き換えない。
+  # 書き換えるのは make fmt だけである。
+  enable:
+    - gofmt

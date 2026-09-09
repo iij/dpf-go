@@ -16,6 +16,8 @@ test/**
 
 # プロジェクト管理 / 生成設定ファイル（再生成で上書きしない）
 LICENSE
+.golangci.yml
+licenses-allowlist.txt
 NOTICE
 CHANGELOG.md
 .github/**
