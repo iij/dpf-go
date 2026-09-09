@@ -142,6 +142,35 @@ CI が落ちた場合は、手元で `make gitleaks` を実行して内容を確
 make test-integration
 ```
 
+## SBOM と provenance
+
+各リリースには SBOM (`sbom.spdx.json`, SPDX 2.3) がアセットとして添付されます。
+root と `misc/*` の計 5 モジュールの依存を単一の文書に含みます。
+生成は [.github/workflows/sbom.yml](.github/workflows/sbom.yml) が
+[syft](https://github.com/anchore/syft) で行います。
+
+```bash
+gh release download v0.1.0 -p sbom.spdx.json --repo iij/dpf-go
+```
+
+SBOM には SLSA provenance attestation が付いており、確かに本リポジトリの
+リリースワークフローがそのタグから生成したものであることを検証できます
+（[gh](https://cli.github.com/) 2.49 以降が必要です）。
+
+```bash
+gh attestation verify sbom.spdx.json --repo iij/dpf-go \
+  --signer-workflow iij/dpf-go/.github/workflows/sbom.yml
+```
+
+`--signer-workflow` は省略しないでください。省略すると「本リポジトリの
+いずれかのワークフロー」までしか絞れず、別のワークフローが署名した文書を
+受け入れてしまいます。
+
+なお、この attestation が保証するのは SBOM 文書そのものが差し替えられて
+いないことです。**コード自体の完全性は `go get` が
+[sum.golang.org](https://sum.golang.org) のチェックサムデータベースに対して
+検証します**。リリースアセットは Go の取得経路には入りません。
+
 ## ライセンス
 
 [Apache License 2.0](LICENSE)

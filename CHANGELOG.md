@@ -10,6 +10,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- リリース公開時に SBOM (`sbom.spdx.json`, SPDX 2.3) を生成し、リリースアセットとして添付する。
+  root と `misc/*` の計 5 モジュールの依存を単一の文書に含む
+- SBOM に対する SLSA provenance attestation。生成元のワークフローとタグを
+  `gh attestation verify` で検証できる（public リポジトリでのみ有効）
+
 ## [0.1.0] - 2026-08-28
 
 初回リリース。
