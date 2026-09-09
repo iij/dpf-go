@@ -2,7 +2,7 @@
 #
 # 統合前の品質ゲート。憲章「開発ワークフローと品質ゲート」のマージ前の表に
 # 対応する検査のうち、ファイル冒頭の規約・依存ライセンス・整形と静的解析を
-# 実行する。脆弱性検査は govulncheck.yml、シークレット検査は gitleaks.yml。
+# 実行する。脆弱性検査は govulncheck.yml、シークレット検査は betterleaks.yml。
 #
 # 版は CI では持たない。Makefile が唯一の出典であり、ここは make ターゲットを
 # 呼ぶだけにする。両者に版があると必ず乖離し、指摘が「環境の差」として
@@ -89,5 +89,5 @@ jobs:
             echo
             echo "版は Makefile が唯一の出典。golangci-lint \`${{ steps.versions.outputs.GOLANGCI_LINT_VERSION }}\` / go-licenses \`${{ steps.versions.outputs.GO_LICENSES_VERSION }}\`。"
             echo
-            echo "脆弱性検査は \`govulncheck\` ワークフロー、シークレット検査は \`gitleaks\` ワークフローで実行する。"
+            echo "脆弱性検査は \`govulncheck\` ワークフロー、シークレット検査は \`betterleaks\` ワークフローで実行する。"
           } >> "$GITHUB_STEP_SUMMARY"

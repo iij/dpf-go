@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# シークレットの混入検査。統合前のゲートであり、失敗した変更は
+# main へマージできない。
+#
+# 導入は go install で行い、版は Makefile の BETTERLEAKS_VERSION から読む。
+# 版を自前で持つ action を使わないのは、手元と CI で版が食い違うと指摘が
+# 「環境の差」として扱われ、ツールの判断が信頼されなくなるためである
+# （憲章「検査ツールの版は単一の出典で固定しなければならない」）。
+#
+# 報告のみのジョブ、検査を飛ばす入力、continue-on-error は置かない。
+# 検出された場合の対処は、値の失効・再発行と履歴の修正であって、
+# ゲートの迂回ではない（憲章 MUST NOT）。
+
+name: betterleaks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  betterleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 履歴全体を走査するため、浅いクローンにしない。
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 版は CI では持たない。Makefile が唯一の出典である。
+      - name: Read pinned tool version
+        id: versions
+        run: |
+          value=$(make --no-print-directory print-BETTERLEAKS_VERSION)
+          if [ -z "$value" ]; then
+            echo "::error::Makefile から BETTERLEAKS_VERSION を読み取れませんでした"
+            exit 1
+          fi
+          echo "BETTERLEAKS_VERSION=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Install betterleaks
+        run: |
+          go install "github.com/betterleaks/betterleaks@${{ steps.versions.outputs.BETTERLEAKS_VERSION }}"
+
+      # 検査は make betterleaks を経由せず直接実行する。
+      # あのターゲットは --verbose を付けるため、CI では使えない（下記）。
+      #
+      # --redact を必ず付ける。付けないと検出したシークレットが
+      # そのまま CI のログに残り、被害を広げてしまう。
+      #
+      # --verbose は付けない。--redact で値は隠れても、ファイル・行・
+      # ルール ID・エントロピー・前後の文脈までは出る。検出箇所の確認は
+      # 手元の make betterleaks で行う。
+      - name: Scan git history
+        run: betterleaks git . --redact --no-banner --exit-code 1
+
+      - name: Scan working tree
+        run: betterleaks dir . --redact --no-banner --exit-code 1
+
+      - name: How to investigate
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          シークレットの疑いが検出された。手元で次を実行して内容を確認すること。
+
+          ```
+          make betterleaks
+          ```
+
+          - 本物だった場合: **まず失効・再発行する**。履歴からの削除だけでは漏洩は止まらない。
+          - 誤検知だった場合: `.betterleaks.toml` に除外を追加し、なぜシークレットでないのかを `description` に書く。
+          EOF
+
+      # 実行ビットの無い hook は git に黙って無視される。壊れた hook を
+      # 「動いているつもり」で使い続けないよう、構文と一緒に検査する。
+      - name: Check git hooks are runnable
+        run: |
+          status=0
+          for hook in .githooks/*; do
+            if [ ! -x "$hook" ]; then
+              echo "::error file=$hook::実行ビットが無く、git に無視される。chmod +x すること"
+              status=1
+            fi
+            sh -n "$hook" || status=1
+          done
+          exit $status

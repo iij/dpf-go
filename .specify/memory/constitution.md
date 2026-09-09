@@ -99,9 +99,6 @@ Sync Impact Report
     シークレット検査の三段構え（pre-commit / pre-push / CI）、
     CI ログに検出箇所を出力しない方針、SBOM（SPDX 2.3）の添付
 - 既知のコンプライアンスギャップ（憲章ではなく実装側の未追随）:
-  - 本憲章はシークレット検査ツールを betterleaks と定める。実装は現在 gitleaks
-    （.gitleaks.toml / .github/workflows/gitleaks.yml / make gitleaks / .githooks/*）
-    であり、betterleaks へ移行するまで憲章と字面が一致しない。移行は別途対応。
   - SPDX ヘッダが internal/integration/*_test.go の 8 ファイルで欠けている。
   - golangci-lint の設定ファイルがリポジトリに存在しない（make lint は設定なしで実行）。
   - govulncheck が Makefile / CI に組み込まれていない。
@@ -122,6 +119,13 @@ Sync Impact Report
   - misc/{vault,aws,azure,gcp} に LICENSE を追加した。独立に取得した利用者へ
     ライセンスが届かない不備の解消であり、あわせて依存ライセンス検査の
     判別不能 4 件（すべて自前モジュール）が 0 件になった。
+  - シークレット検査を gitleaks から betterleaks (v1.8.1) へ移行した。本憲章が
+    定める字面に実装が一致した。.betterleaks.toml / .betterleaksignore /
+    .github/workflows/betterleaks.yml / make betterleaks / .githooks/* が対象。
+    あわせて、それまで CI (gitleaks.yml) が自前で持っていた版の固定値を
+    Makefile の BETTERLEAKS_VERSION へ寄せ、「検査ツールの版は単一の出典で
+    固定しなければならない」を満たした。make betterleaks も他のゲートと同じく
+    版が固定値と一致しない場合は終了コード 2 で中断する。
 - 派生元: CLAUDE.md（開発ルール・各タスク仕様）、Makefile、.openapi-generator-ignore、
   openapi-generator-config.yaml、README.md、.github/workflows/、doc.go、
   specs/001-constitution-compliance-gates/（research.md D1・D2・D6・D8 の実測）

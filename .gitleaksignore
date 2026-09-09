@@ -1,5 +1,0 @@
-# gitleaks の個別除外（フィンガープリント単位）。
-#
-# 恒久的な除外ルールは .gitleaks.toml の allowlists に書くこと。
-# このファイルは「特定のコミットの特定の行だけを一度きり除外する」用途に使う。
-# 行の形式: <commit>:<file>:<rule-id>:<line>

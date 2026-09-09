@@ -20,13 +20,13 @@ MODULES := $(sort $(patsubst ./%,%,$(patsubst %/,%,$(dir $(shell find . \
 GOLANGCI_LINT_VERSION := 2.13.2
 GOVULNCHECK_VERSION := v1.7.0
 GO_LICENSES_VERSION := v2.0.1
+BETTERLEAKS_VERSION := v1.8.1
 
 # シークレット検査のターゲット名。
 #
-# 憲章はこの検査を betterleaks と定めるが、実装は現時点で gitleaks である。
-# 一括実行 (make check) がこのターゲットを呼ぶため、名前を変数にしておき、
-# betterleaks への移行時にこの 1 行だけで切り替わるようにする。
-SECRET_SCAN_TARGET := gitleaks
+# 一括実行 (make check) がこのターゲットを呼ぶ。名前を変数にしておくことで、
+# 検査ツールを入れ替えるときの変更をこの 1 行に閉じられる。
+SECRET_SCAN_TARGET := betterleaks
 
 # 検査ゲートの共通規約。
 #
@@ -75,11 +75,14 @@ endef
 #
 # 取得手段はツールごとに異なる。go-licenses は --version / -version /
 # version のいずれも持たず、自身の版を報告できないため、ビルド情報から読む。
+# betterleaks は version サブコマンドを持つが、go install で導入した場合は
+# "dev" を返して固定値と比較できないため、同じくビルド情報から読む。
 GOLANGCI_LINT_PROBE = golangci-lint --version | sed -n 's/.*has version \([^ ]*\) .*/\1/p'
 GOVULNCHECK_PROBE = govulncheck --version | sed -n 's/^Scanner: govulncheck@//p'
 GO_LICENSES_PROBE = go version -m "$$(command -v go-licenses)" | awk '$$1=="mod"{print $$3; exit}'
+BETTERLEAKS_PROBE = go version -m "$$(command -v betterleaks)" | awk '$$1=="mod"{print $$3; exit}'
 
-.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration gitleaks install-hooks uninstall-hooks tidy-all check check-headers check-licenses check-lint check-vuln
+.PHONY: all generate clean templates executeall fmt tidy build build-all test test-integration betterleaks install-hooks uninstall-hooks tidy-all check check-headers check-licenses check-lint check-vuln
 
 all: generate
 
@@ -196,6 +199,7 @@ check:
 	$(call require_version,golangci-lint,$(GOLANGCI_LINT_VERSION),$(GOLANGCI_LINT_PROBE))
 	$(call require_version,go-licenses,$(GO_LICENSES_VERSION),$(GO_LICENSES_PROBE))
 	$(call require_version,govulncheck,$(GOVULNCHECK_VERSION),$(GOVULNCHECK_PROBE))
+	$(call require_version,betterleaks,$(BETTERLEAKS_VERSION),$(BETTERLEAKS_PROBE))
 	@failed=""; \
 	for t in build-all test check-lint check-headers check-licenses check-vuln $(SECRET_SCAN_TARGET); do \
 		echo ""; \
@@ -275,10 +279,11 @@ check-vuln:
 # --verbose が無いと「leaks found: N」しか出ず、場所が分からない。
 # 手元での実行なので詳細を出す（CI では付けない。CI が落ちた時の内容確認は
 # このターゲットで行う）。
-# 誤検知の除外は .gitleaks.toml に定義する。理由を書かずに除外しないこと。
-gitleaks:
-	gitleaks git . --redact --verbose --no-banner --exit-code 1
-	gitleaks dir . --redact --verbose --no-banner --exit-code 1
+# 誤検知の除外は .betterleaks.toml に定義する。理由を書かずに除外しないこと。
+betterleaks:
+	$(call require_version,betterleaks,$(BETTERLEAKS_VERSION),$(BETTERLEAKS_PROBE))
+	betterleaks git . --redact --verbose --no-banner --exit-code 1
+	betterleaks dir . --redact --verbose --no-banner --exit-code 1
 
 # .githooks/ の git hook を有効化する（clone 直後に一度実行する）。
 #

@@ -37,8 +37,15 @@
   （書き換えるのは `make fmt`）
 - ビルド・テスト・各検査の対象モジュールを `go.mod` の位置から導出するようにした。
   固定の列挙を持たないため、モジュールを増やしても対象から漏れない
-- 検査ツール（`golangci-lint`、`go-licenses`、`govulncheck`）の版を `Makefile` で固定。
-  CI は自前で版を持たず、同じ値を参照する。導入済みの版が異なる場合、検査は省略されず中断する
+- 検査ツール（`golangci-lint`、`go-licenses`、`govulncheck`、`betterleaks`）の版を
+  `Makefile` で固定。CI は自前で版を持たず、同じ値を参照する。導入済みの版が異なる場合、
+  検査は省略されず中断する
+- シークレットの混入検査を `gitleaks` から
+  [`betterleaks`](https://github.com/betterleaks/betterleaks) v1.8.1 へ移行。
+  三段構え（`pre-commit` / `pre-push` / CI）の構成と検査対象は変わらない。
+  `make gitleaks` は `make betterleaks` に、設定ファイルは `.gitleaks.toml` /
+  `.gitleaksignore` から `.betterleaks.toml` / `.betterleaksignore` に、
+  CI のワークフローは `gitleaks` から `betterleaks` に改名した
 
 ### Fixed
 

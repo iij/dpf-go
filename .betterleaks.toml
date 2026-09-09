@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# gitleaks の設定。
+# betterleaks の設定。
 #
 # 既定のルールセットをそのまま使い、誤検知の除外だけを定義する。
 # 除外を追加する場合は、なぜシークレットでないのかを description に必ず書くこと。

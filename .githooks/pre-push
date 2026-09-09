@@ -18,13 +18,14 @@ remote_name="${1:-origin}"
 
 cd "$(git rev-parse --show-toplevel)"
 
-if ! command -v gitleaks >/dev/null 2>&1; then
+if ! command -v betterleaks >/dev/null 2>&1; then
 	cat >&2 <<'EOF'
-gitleaks が見つからないため、シークレット検査ができない。
+betterleaks が見つからないため、シークレット検査ができない。
 検査せずに公開すると取り返しがつかないので、push を中断する。
 
-  導入: https://github.com/gitleaks/gitleaks#installing
-        （CI と同じ v8 系を使うこと。make gitleaks で同じ検査が走る）
+  導入: go install github.com/betterleaks/betterleaks@"$(make print-BETTERLEAKS_VERSION)"
+        （版は Makefile の BETTERLEAKS_VERSION が唯一の出典。
+          make betterleaks で同じ検査が走る）
   回避: git push --no-verify
 EOF
 	exit 1
@@ -60,5 +61,5 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
 
 	# --log-opts の内容はそのまま git log に渡される。
 	# --redact と --verbose の理由は pre-commit と同じ。
-	gitleaks git . --redact --verbose --no-banner --exit-code 1 --log-opts="$log_opts"
+	betterleaks git . --redact --verbose --no-banner --exit-code 1 --log-opts="$log_opts"
 done

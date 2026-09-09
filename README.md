@@ -114,7 +114,7 @@ make generate      # openapi.json から api/model を再生成（Docker が必�
 | ファイル冒頭の規約 | `make check-headers` | すべての Go ファイル（テスト・生成物を含む） |
 | 依存ライセンス | `make check-licenses` | 同モジュールの依存 |
 | 到達可能な既知脆弱性 | `make check-vuln` | 同モジュールの依存 |
-| シークレットの混入 | `make gitleaks` | 履歴と作業ツリー |
+| シークレットの混入 | `make betterleaks` | 履歴と作業ツリー |
 
 検査対象のモジュールは `go.mod` の位置から導出しています。モジュールを増やしても
 `Makefile` を書き換える必要はありません。
@@ -142,14 +142,14 @@ make generate      # openapi.json から api/model を再生成（Docker が必�
 
 ### シークレットの混入検査
 
-[gitleaks](https://github.com/gitleaks/gitleaks) で三段構えに検査しています。
+[betterleaks](https://github.com/betterleaks/betterleaks) で三段構えに検査しています。
 `make check` からも実行されます。
 
 | 段 | 実体 | 走査対象 |
 |---|---|---|
 | コミット時 | [.githooks/pre-commit](.githooks/pre-commit) | ステージした変更 |
 | push 時 | [.githooks/pre-push](.githooks/pre-push) | リモートにまだ無いコミットの履歴 |
-| CI | [.github/workflows/gitleaks.yml](.github/workflows/gitleaks.yml) | 履歴全体と作業ツリー |
+| CI | [.github/workflows/betterleaks.yml](.github/workflows/betterleaks.yml) | 履歴全体と作業ツリー |
 
 git は clone で hook を持ってこないため、clone 直後に一度だけ有効化してください。
 `core.hooksPath` をリポジトリ管理の `.githooks/` に向けます（グローバルの
@@ -159,17 +159,17 @@ git は clone で hook を持ってこないため、clone 直後に一度だけ
 make install-hooks
 ```
 
-hook は最後の砦なので、gitleaks が入っていなければ検査せず通すのではなく
+hook は最後の砦なので、betterleaks が入っていなければ検査せず通すのではなく
 中断します。急ぎで飛ばす必要があれば `git commit --no-verify` /
 `git push --no-verify` を使えますが、その場合も CI で必ず検査されます。
-`main` へのマージには CI の `gitleaks` の成功が必須です。
+`main` へのマージには CI の `betterleaks` の成功が必須です。
 
-CI が落ちた場合は、手元で `make gitleaks` を実行して内容を確認してください。
+CI が落ちた場合は、手元で `make betterleaks` を実行して内容を確認してください。
 
 検出されたものが本物だった場合は、**まずトークンを失効・再発行してください**。
 履歴から消しても、一度 push された値は漏洩したものとして扱う必要があります。
 
-誤検知の除外は [.gitleaks.toml](.gitleaks.toml) に定義しています。
+誤検知の除外は [.betterleaks.toml](.betterleaks.toml) に定義しています。
 除外を追加する場合は、なぜシークレットでないのかを `description` に必ず記載してください。
 
 実際の DPF-API と権威 DNS サーバを使う統合テストは、`integration` ビルドタグで
