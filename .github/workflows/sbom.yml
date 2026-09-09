@@ -123,22 +123,40 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       # GitHub の attestation API は public リポジトリ、または GHAS 付きの
-      # private でのみ使える。公開前は使えないため visibility で分岐する。
+      # private / internal でのみ使える。公開前は使えないため visibility で
+      # 分岐する。internal は GHAS の有無を CI から判定できないため、
+      # 保守的に「使えない」扱いにする。
       #
       # continue-on-error で黙って飛ばすと「失敗したのに成功に見える」ため、
       # 省略した理由をログとサマリに残す (integration.yml の
       # Check required secrets と同じ方針)。
+      #
+      # 値は必ず小文字化してから比較する。gh repo view は GraphQL の
+      # RepositoryVisibility enum をそのまま返すため PRIVATE / PUBLIC と
+      # 大文字になり、REST の repos/{repo} は private / public と小文字になる。
+      # 小文字前提で書くと public 化しても分岐が一致せず、attestation が
+      # 黙って省略され続ける。
+      #
+      # 未知の値は警告ではなくエラーにする。判定できないまま「未署名で成功」に
+      # なると、このステップを置いた意味が無くなる。
       - name: Check attestation availability
         id: attest_check
         run: |
-          visibility=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)
-          if [ "$visibility" = "public" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::リポジトリが $visibility のため provenance attestation を省略した"
-            echo "> **注意**: リポジトリが \`$visibility\` のため SBOM は未署名。" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility | tr '[:upper:]' '[:lower:]')
+          case "$visibility" in
+            public)
+              echo "enabled=true" >> "$GITHUB_OUTPUT"
+              ;;
+            private | internal)
+              echo "enabled=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::リポジトリが $visibility のため provenance attestation を省略した"
+              echo "> **注意**: リポジトリが \`$visibility\` のため SBOM は未署名。" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::error::visibility を判定できなかった ($visibility)。attestation の要否が決められない"
+              exit 1
+              ;;
+          esac
 
       # SBOM 自体を subject にする。本リポジトリはバイナリを配布せず、
       # このワークフローの成果物は SBOM そのものであるため、「この SBOM を
