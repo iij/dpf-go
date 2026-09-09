@@ -67,7 +67,8 @@ func TestZoneLookup_LongestMatch(t *testing.T) {
 		},
 		{
 			// ドメイン名の比較は miekg/dns で正規化してから行うという
-			// CLAUDE.md の要件を、実 API が返す Zone.Name の表記に対して裏付ける。
+			// 要件 (憲章 原則 IV / specs/003-utils-highlevel-api/spec.md FR-030) を、
+			// 実 API が返す Zone.Name の表記に対して裏付ける。
 			name:  "大文字小文字を区別しない",
 			input: "WWW.SUB.SUB.DNS-TOOL-TEST.JP.",
 			want:  zoneSubSub,

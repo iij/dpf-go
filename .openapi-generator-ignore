@@ -20,7 +20,6 @@ NOTICE
 CHANGELOG.md
 .github/**
 Makefile
-CLAUDE.md
 README.md
 openapi.json
 openapi-generator-config.yaml
@@ -36,3 +35,7 @@ utils/**
 misc/**
 tools/**
 templates/**
+
+# 仕様・憲章（再生成で触れない）
+specs/**
+.specify/**

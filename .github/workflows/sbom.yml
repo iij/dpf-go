@@ -106,7 +106,7 @@ jobs:
 
           # 依存の抽出に失敗しても syft は成功で終了する。root の直接依存である
           # miekg/dns を目印にして、go.mod が実際に読まれたことを確認する
-          # (CLAUDE.md の開発ルールでドメイン名操作に必須のため、消えることはない)。
+          # (憲章 原則 IV でドメイン名操作に必須のため、消えることはない)。
           jq -e 'any(.packages[]; .name == "github.com/miekg/dns")' sbom.spdx.json > /dev/null
 
           # SYFT_SOURCE_VERSION が効いており、対象バージョンが文書に

@@ -139,7 +139,7 @@ func TestReadOnly_JobID(t *testing.T) {
 }
 
 // TestReadOnly_ErrorModel は、エラー応答からエラーコードと対象属性を
-// 取り出せることを確認する（CLAUDE.md 仕様 7）。
+// 取り出せることを確認する（specs/002-openapi-generation-pipeline/spec.md FR-019）。
 //
 // 実測した DPF-API の挙動:
 //   - 存在しないゾーンでも 404 ではなく 400 ParameterError が返り、
