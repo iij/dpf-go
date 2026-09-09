@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# リリース時に SBOM (sbom.spdx.json) を生成し、リリースページへ添付する。
+#
+# 本リポジトリは複数モジュール構成のため、リポジトリ全体を 1 度走査し、
+# root と misc/* の計 5 つの go.mod を単一の SPDX 文書にまとめる。
+#
+# 生成は anchore/sbom-action (syft) に任せるが、リリースへの添付は gh で
+# 明示的に行う。action 自身のアップローダ (upload-release-assets) を
+# 使わない理由:
+#   - 添付されるアセット名が output-file ではなく artifact-name 入力から
+#     決まる。未指定時は dpf-go-sbom.spdx.json となり、意図した名前にならない
+#   - 生成と添付が同一ステップで完結するため、壊れた SBOM を検査したり
+#     attestation を挟んだりする余地が無い
+
+name: sbom
+
+on:
+  release:
+    types: [published]
+  # 既存のリリースへ後から添付・貼り直しするための経路。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: SBOM を添付するリリースのタグ (例 v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# 同一タグに対する多重実行を避ける。cancel-in-progress は false にする。
+# アセットの差し替え中にキャンセルすると、リリースから SBOM が消えたままに
+# なりうる。
+concurrency:
+  group: dpf-sbom-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # ワークフロー既定の read のまま、この job だけに必要な権限を与える。
+    permissions:
+      contents: write # リリースアセットのアップロード
+      id-token: write # Sigstore への OIDC トークン要求
+      attestations: write # attestation の登録
+
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # release イベントの既定 ref はタグの指すコミットだが、
+          # workflow_dispatch では既定ブランチになる。SBOM は必ずタグの
+          # 内容から作るため、どちらの経路でも明示的にタグを指定する。
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      # 添付先が無いまま SBOM を作っても捨てるだけなので、先に確かめる。
+      - name: Check release exists
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "::error::タグを特定できなかった"
+            exit 1
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null
+
+      # syft は .github/workflows/* からも依存 (GithubActionPkg) を拾う。
+      # CI のサプライチェーンを記録する意味があるのでそのまま含める。
+      #
+      # syft のバージョンは action 同梱のもの (v0.24.2 では syft v1.51.1) を
+      # 使う。syft-version で個別指定すると action 側で検証済みの組み合わせ
+      # から外れるため、action のタグ更新で一括して上げる。
+      #
+      # third-party のため @v0 ではなくパッチまで固定する。@v0 は動くタグで、
+      # リリース成果物の生成経路の中身が黙って変わる。
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.24.2
+        env:
+          # SPDX 文書に「どのリリースの SBOM か」を記録する。既定では文書名が
+          # チェックアウトパス (/home/runner/work/dpf-go/dpf-go) になり、
+          # バージョンがどこにも残らないため、利用者がリリースページから
+          # 落とした SBOM だけを見て対象を特定できない。
+          # syft は SYFT_ 接頭辞の環境変数で設定を受け取る。
+          SYFT_SOURCE_NAME: github.com/${{ github.repository }}
+          SYFT_SOURCE_VERSION: ${{ github.event.release.tag_name || inputs.tag }}
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          # 失敗時に中身を確認できるよう、ワークフロー成果物には残す。
+          upload-artifact: true
+          artifact-name: sbom.spdx.json
+          # 添付は後続ステップで行う。
+          upload-release-assets: false
+
+      # 壊れた、あるいは中身の無い SBOM を「添付済み」にしてしまわないよう、
+      # リリースへ上げる前に検査する。
+      - name: Validate SBOM
+        run: |
+          jq -e '.spdxVersion and .SPDXID and (.packages | length) > 0' sbom.spdx.json > /dev/null
+
+          # 依存の抽出に失敗しても syft は成功で終了する。root の直接依存である
+          # miekg/dns を目印にして、go.mod が実際に読まれたことを確認する
+          # (CLAUDE.md の開発ルールでドメイン名操作に必須のため、消えることはない)。
+          jq -e 'any(.packages[]; .name == "github.com/miekg/dns")' sbom.spdx.json > /dev/null
+
+          # SYFT_SOURCE_VERSION が効いており、対象バージョンが文書に
+          # 残っていることを確認する。環境変数名を間違えても syft は
+          # 黙って既定値を使うため、ここで気づけるようにする。
+          root=$(jq -r '.relationships[] | select(.relationshipType == "DESCRIBES") | .relatedSpdxElement' sbom.spdx.json)
+          got=$(jq -r --arg r "$root" '.packages[] | select(.SPDXID == $r) | .versionInfo' sbom.spdx.json)
+          if [ "$got" != "$TAG" ]; then
+            echo "::error::SBOM が記録するバージョン ($got) がタグ ($TAG) と一致しない"
+            exit 1
+          fi
+
+          jq -r '"SBOM: \(.name) \(.packages | length) パッケージ (\(.spdxVersion))"' sbom.spdx.json \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # GitHub の attestation API は public リポジトリ、または GHAS 付きの
+      # private でのみ使える。公開前は使えないため visibility で分岐する。
+      #
+      # continue-on-error で黙って飛ばすと「失敗したのに成功に見える」ため、
+      # 省略した理由をログとサマリに残す (integration.yml の
+      # Check required secrets と同じ方針)。
+      - name: Check attestation availability
+        id: attest_check
+        run: |
+          visibility=$(gh repo view "$GITHUB_REPOSITORY" --json visibility -q .visibility)
+          if [ "$visibility" = "public" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::リポジトリが $visibility のため provenance attestation を省略した"
+            echo "> **注意**: リポジトリが \`$visibility\` のため SBOM は未署名。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # SBOM 自体を subject にする。本リポジトリはバイナリを配布せず、
+      # このワークフローの成果物は SBOM そのものであるため、「この SBOM を
+      # このワークフローがこのタグから生成した」という provenance が
+      # 求める主張と一致する。
+      #
+      # ソースツリーそのものは attest しない。GitHub が自動生成する
+      # ソース tarball はバイト単位で安定する保証が無く、検証が壊れやすい。
+      # Go 利用者にとってのソース完全性は sum.golang.org が担う。
+      #
+      # actions/attest-sbom は deprecated のため使わない。
+      - name: Attest SBOM provenance
+        if: steps.attest_check.outputs.enabled == 'true'
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: sbom.spdx.json
+
+      # 添付は attestation より後に置く。public な状態で署名に失敗した場合、
+      # 未署名の SBOM を公開せずに job が止まる。
+      - name: Attach SBOM to release
+        run: |
+          # --clobber を付ける。再実行時に「アセットが既にある」で失敗させず、
+          # 生成し直したものへ差し替える。
+          gh release upload "$TAG" sbom.spdx.json --clobber --repo "$GITHUB_REPOSITORY"
+          echo "\`sbom.spdx.json\` を [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG) に添付した" \
+            >> "$GITHUB_STEP_SUMMARY"
