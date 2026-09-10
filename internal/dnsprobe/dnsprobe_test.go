@@ -262,20 +262,14 @@ func TestWaitAll_ContextCancel(t *testing.T) {
 
 // startTestDNS は UDP と TCP の両方で待ち受けるテスト用 DNS サーバを起動し、
 // その "ip:port" を返す。
+//
+// UDP と TCP を同じポートで開くのは DNS の仕様上の要請である。Exchange は
+// UDP の応答が切り詰められた場合に同じ "host:port" へ TCP で再試行するため、
+// ポートを別にすると再試行の宛先が存在せず、その分岐を検証できない。
 func startTestDNS(t *testing.T, handler dns.HandlerFunc) string {
 	t.Helper()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen udp: %v", err)
-	}
-	addr := pc.LocalAddr().String()
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		_ = pc.Close()
-		t.Fatalf("listen tcp: %v", err)
-	}
+	pc, ln, addr := listenBoth(t)
 
 	udpSrv := &dns.Server{PacketConn: pc, Handler: handler}
 	tcpSrv := &dns.Server{Listener: ln, Handler: handler}
@@ -299,6 +293,45 @@ func startTestDNS(t *testing.T, handler dns.HandlerFunc) string {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return addr
+}
+
+// listenBoth は同じポートで UDP と TCP の両方を待ち受け、その組と "ip:port" を返す。
+//
+// TCP を先に取る。UDP から取ると、ポート番号が決まってから TCP を開くまでの間に
+// 別プロセスが同じ番号の TCP を取ることがあり、"bind: address already in use" で
+// 落ちる。UDP と TCP はポート空間が独立しているため、UDP で空いていることは
+// TCP で空いていることを保証しない。TCP の :0 は OS が未使用の番号を選び、
+// listen している間はその番号を保持するため、先に取るほうが衝突しにくい。
+//
+// それでも「TCP で取れた番号の UDP が使われている」可能性は残るので、その場合は
+// 番号を捨てて取り直す。
+func listenBoth(t *testing.T) (net.PacketConn, net.Listener, string) {
+	t.Helper()
+
+	// 数回で十分。これを超えて衝突し続けるのは、番号の偶然ではなく
+	// 環境側の問題（ephemeral ポートの枯渇など）である。
+	const attempts = 5
+
+	var lastErr error
+	for range attempts {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen tcp: %v", err)
+		}
+		addr := ln.Addr().String()
+
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			// この番号は UDP 側が使われている。TCP を閉じて別の番号を試す。
+			_ = ln.Close()
+			lastErr = err
+			continue
+		}
+		return pc, ln, addr
+	}
+
+	t.Fatalf("listen udp+tcp: 同じポートを %d 回試しても確保できませんでした: %v", attempts, lastErr)
+	return nil, nil, ""
 }
 
 // txtHandler は指定した値の TXT を権威応答で返すハンドラを作る。
