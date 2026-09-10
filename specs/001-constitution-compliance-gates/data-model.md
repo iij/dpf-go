@@ -156,13 +156,21 @@
 | `golangci-lint` | `2.13.2` | `golangci-lint --version` |
 | `govulncheck` | `v1.7.0` | `govulncheck --version` |
 | `go-licenses` | `v2.0.1` | `go version -m $(command -v go-licenses)` |
+| `betterleaks` | `v1.8.1` | `go version -m $(command -v betterleaks)` |
 
 `go-licenses` は `--version` / `-version` / `version` のいずれも持たないため、
-ビルド情報から読む（research.md D9）。
+ビルド情報から読む。`betterleaks` は `--version` を持つが `dev` を返すため、
+同じくビルド情報から読む（research.md D9）。
+
+`ProbeCommand` は `make` のレシピでコマンド位置へ直接展開する。シェル変数へ
+代入してはならない（research.md D11）。
 
 **検証規則**:
 
 - ローカルの検査は、`ProbeCommand` の出力から版を抽出し、`Version` と一致することを
   確かめる。一致しない、未導入、または**抽出に失敗した**場合は中断する（FR-025）。
   いずれも成功扱いにしてはならない。
+- 一括実行（`make check`）は 4 件すべての検証をゲート実行の前にまとめて行う。
+  これにより「検査できなかった」と「違反があった」が実行順序で区別される
+  （research.md D10）。
 - CI は自前で版を持たず、この定義を参照する（FR-015、FR-029）。

@@ -13,13 +13,21 @@ go version                                        # go1.27 以上
 golangci-lint --version                           # 2.13.2 と一致すること
 govulncheck --version                             # Scanner: govulncheck@v1.7.0
 go version -m "$(command -v go-licenses)" | grep go-licenses   # v2.0.1
+go version -m "$(command -v betterleaks)" | grep betterleaks   # v1.8.1
 ```
 
-`go-licenses` だけ取得方法が違うのは、自身の版を報告する手段を持たないためである
-（[research.md](./research.md) D9）。
+`go-licenses` と `betterleaks` が取得方法が違うのは、自身の版を報告する手段が
+無い（前者）か `dev` を返す（後者）ためである（[research.md](./research.md) D9）。
 
-版が固定値と違う場合、各ターゲットは終了コード 2 で中断する。これは想定どおりの
-挙動である（FR-025）。導入方法は失敗時のメッセージが示す。
+版が固定値と違う場合、検査は省略されず中断する。これは想定どおりの挙動である
+（FR-025）。
+
+導入方法は失敗時のメッセージが示す。
+
+**終了コードについて**: `make` はレシピが失敗すると必ず 2 で終了するため、
+`make` の終了コードで「違反あり」と「検査できなかった」を区別できない
+（[research.md](./research.md) D10）。区別は `make check` の `RESULT` 行、
+または `go run ./tools/checkheaders` のようにツールを直接呼んで確認する。
 
 ## 1. 一括実行
 
@@ -27,9 +35,10 @@ go version -m "$(command -v go-licenses)" | grep go-licenses   # v2.0.1
 make check
 ```
 
-期待: 終了コード 0。統合前に満たすべき 7 ゲートすべてが通る（FR-030。本機能の 4 種と、
-既存のビルド・単体テスト・シークレット検査）。`reciprocal` の依存（HashiCorp 系 10 件）は
-報告として出るが、失敗にはならない。
+期待: 終了コード 0 と `RESULT: ok`。統合前に満たすべき 7 ゲートすべてが通る
+（FR-030。本機能の 4 種と、既存のビルド・単体テスト・シークレット検査）。
+`reciprocal` の依存（HashiCorp 系 10 件）は報告として出るが、失敗にはならない。
+実測の所要時間は約 25 秒（Go のビルドキャッシュが温まっている状態）。
 
 内訳を個別に確かめる場合は手順 2〜5 を、一括実行が本当に 7 ゲートを呼んでいるかは
 手順 7 を参照する。
@@ -190,7 +199,11 @@ make -n check
 
 期待: 出力に 7 つのゲート（`build-all`, `test`, `check-lint`, `check-headers`,
 `check-licenses`, `check-vuln`, `betterleaks`）がすべて現れる。本機能の 4 種だけでは
-足りない。1 つが失敗しても残りが実行され、最後にまとめて報告されることも確認する。
+足りない。1 つが失敗しても残りが実行され、最後に `RESULT` 行でまとめて報告される
+ことも確認する。
+
+シークレット検査は `SECRET_SCAN_TARGET` 変数から呼ばれるため、憲章が定める
+ツール名が変わってもこの一覧は追随する。
 
 ## 8. 作業ツリーが変わらないこと (FR-028 / SC-011)
 
