@@ -302,3 +302,17 @@ Task: "tools/checklicenses/doc.go を作成"
 - [X] T053 `make generate` の実行後に `make check-headers` が 0 件で通ることを確認した。**再生成による差分は 0 件**で、生成物 7 種（`api_*` / `model_*` / `client` / `configuration` / `response` / `utils` / `executeall_gen`）の先頭行はいずれも SPDX 識別子だった。T015 で機構の確認に留めていた部分を実測で埋めた per FR-006 (partial)
 
 **Checkpoint**: 判定ロジックだけでなく入出力と走査の層も検証され、複合式の偽陽性が解消する
+
+---
+
+## フェーズ 9: 収束 (Convergence, 2 回目)
+
+**目的**: フェーズ 8 の実装後に再評価した結果、複合式の解釈に緩い経路が残っていた。
+`/speckit-converge` が検出した 4 件で、憲章違反は無い。
+
+- [X] T054 `tools/checklicenses/verdict.go` の `evaluate` で、末尾に演算子だけが残る不完全な式（`MIT AND`、`MIT OR`）を判別不能として扱う。現在は被演算子が 1 つになると演算子を無視して単一ライセンスとして許容し、実測で `verdictOf("MIT AND")` が `allowed` / 報告 `MIT` を返す。`A AND B` が途中で切れた入力では B の義務が落ちるため判定が実際より緩くなる。解釈できない形は判別不能へ倒す方針に反する。`verdict_test.go` にケースを追加して固定する per spec: 境界的な状況（デュアルライセンス） (partial)
+- [X] T055 `specs/001-constitution-compliance-gates/data-model.md` の Verdict 節と `contracts/gates.md` を、複合式の解釈と「選択したライセンスの報告」に合わせて更新する。現在の判定表は `LicenseID` が単一の識別子である前提で書かれており、`OR` で選択が生じた場合に報告へ残すライセンスが入力と異なることも、`AND` で義務が最も重いものになることも記述されていない per spec: 境界的な状況（デュアルライセンス） / contracts: Verdict (partial)
+- [X] T056 `tools/checkheaders/check.go` の `skipPath` からバックスラッシュを区切りとする分岐を削除する。`main.go` が `filepath.ToSlash` で正規化してから呼ぶため到達不能であり、Windows でも ToSlash が変換する。加えて Linux では `\` が正当なファイル名文字であるため、`foo\vendor\bar.go` という 1 つのファイル名を誤って除外しうる。削除しない場合は到達する経路を示すコメントを残す per plan: checkheaders の走査 (unrequested)
+- [X] T057 未テストの 2 分岐にテストを追加する。`tools/checkheaders/main.go` の `run()` の並び替えのタイブレーク（同一パスで `missing-spdx` と `preamble-pragma` の 2 件が出る場合の順序）と、`tools/checklicenses/verdict.go` の `evaluate` の空フィールド分岐（空白のみのライセンス識別子。実測では `undetermined` を返す） per FR-004 / 憲章 II (partial)
+
+**Checkpoint**: 複合式の解釈に緩い経路が残らず、設計文書が実装と一致する
