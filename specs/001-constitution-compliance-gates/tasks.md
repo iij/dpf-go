@@ -175,6 +175,7 @@ description: "憲章準拠のツール整備のタスク一覧"
 - [X] T044 `PATH` からツールを外した状態、および版を固定値と違えた状態で各 `check-*` ターゲットが終了コード 2 になることを確認する。版の抽出に失敗する場合も 2 であり、0 にならないこと（FR-025, SC-009, research.md D9）
 - [X] T045 [quickstart.md](./quickstart.md) の手順 1〜8 をすべて実行し、仕様の受け入れシナリオ 25 件に対応する確認が通ることを検証する
 - [X] T046 `misc/vault/LICENSE`, `misc/aws/LICENSE`, `misc/azure/LICENSE`, `misc/gcp/LICENSE`（本計画の作成時に追加済み）が `make check-licenses` の判別不能を 0 件にしていることを確認する（research.md D3）
+- [X] T048 `.github/workflows/checks.yml` に `make build-all` と `make test` のステップを追加する。憲章のマージ前 7 ゲートはすべて CI で強制されなければならない（憲章「手元と CI で同じ結果が再現されなければならない（MUST）」）。外部ツールの導入より前に置き、壊れたビルドでダウンロードに時間を使わないようにする
 - [X] T047 `.specify/memory/constitution.md`（v2.0.0）の品質ゲート表と `Makefile` が一致することを確認する。マージ前 7 行に対応する `make` ターゲットがすべて存在し、削除した `lint` が表に残っていないこと。リリース専用のゲートが実装されていないことも確認する
 
 ---

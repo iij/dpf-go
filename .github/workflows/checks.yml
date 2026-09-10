@@ -52,6 +52,17 @@ jobs:
       - name: Check file header conventions
         run: make check-headers
 
+      # ビルドと単体テストも憲章のマージ前ゲートである。外部ツールの導入より
+      # 前に置いて、壊れたビルドで時間を使わないようにする。
+      - name: Build all modules
+        run: make build-all
+
+      # 単体テストはネットワークアクセスを必要としない（憲章 原則 II）。
+      # 実 API と権威 DNS サーバを使う統合テストは integration ビルドタグで
+      # 隔離されており、ここでは走らない（integration ワークフローが担当）。
+      - name: Run unit tests
+        run: make test
+
       - name: Install golangci-lint
         run: |
           version="${{ steps.versions.outputs.GOLANGCI_LINT_VERSION }}"
@@ -84,10 +95,14 @@ jobs:
             echo "| 検査 | コマンド |"
             echo "|---|---|"
             echo "| ファイル冒頭の規約 | \`make check-headers\` |"
+            echo "| ビルド | \`make build-all\` |"
+            echo "| 単体テスト | \`make test\` |"
             echo "| 整形・静的解析 | \`make check-lint\` |"
             echo "| 依存ライセンス | \`make check-licenses\` |"
             echo
             echo "版は Makefile が唯一の出典。golangci-lint \`${{ steps.versions.outputs.GOLANGCI_LINT_VERSION }}\` / go-licenses \`${{ steps.versions.outputs.GO_LICENSES_VERSION }}\`。"
             echo
             echo "脆弱性検査は \`govulncheck\` ワークフロー、シークレット検査は \`betterleaks\` ワークフローで実行する。"
+            echo
+            echo "憲章のマージ前 7 ゲートのうち、上表の 5 つを本ワークフローが担う。"
           } >> "$GITHUB_STEP_SUMMARY"

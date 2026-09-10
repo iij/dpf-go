@@ -153,10 +153,22 @@ github.com/cespare/xxhash/v2,https://github.com/cespare/xxhash/blob/v2.3.0/LICEN
 
 ## CI の契約
 
+憲章のマージ前 7 ゲートは、すべて CI で強制されなければならない。憲章は
+「手元と CI で同じ結果が再現されなければならない（MUST）」と定めており、CI で
+実行されないゲートはこの条件を満たせない。
+
 | ワークフロー | トリガ | 呼ぶもの | 失敗時 |
 |---|---|---|---|
-| 新規チェック | `pull_request`, `push` | `make check-headers`, `make check-licenses`, `make check-lint` | 統合を止める |
+| チェック | `pull_request`, `push` | `make check-headers`, `make build-all`, `make test`, `make check-lint`, `make check-licenses` | 統合を止める |
 | 脆弱性 | `pull_request`, `push` | `make check-vuln` | **統合を止める**（FR-021） |
+| シークレット | `pull_request`, `push` | `make betterleaks` | 統合を止める |
+
+ビルドと単体テストを外部ツールの導入より前に置く。壊れたビルドでツールの
+ダウンロードに時間を使わないため。
+
+脆弱性とシークレットを別のワークフローに分けるのは、前者が外部の脆弱性
+データベースの状態に依存し、後者が履歴全体の取得（`fetch-depth: 0`）を要する
+ためである。それぞれを独立に再実行できる。
 
 リリース専用のゲートは設けない。`main` がマージ前ゲートをすべて満たしているため、
 リリース時点で改めて満たすべき品質ゲートは無い（憲章「リリースは `main` から行う」）。
