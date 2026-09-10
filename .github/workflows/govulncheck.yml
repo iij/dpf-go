@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 到達可能な既知脆弱性の検査。統合前のゲートであり、失敗した変更は
+# main へマージできない。
+#
+# checks.yml と分けているのは、この検査だけが外部の脆弱性データベースの
+# 状態に依存し、コード変更なしに結果が変わるためである。別のワークフローに
+# しておくと「コードは変わっていないのに落ちた」場合に、この検査だけを
+# 再実行して切り分けられる。
+#
+# リリース専用のジョブは置かない。リリースは main から行い、main は
+# マージ前ゲートをすべて満たしているため、リリース時点で改めて満たすべき
+# 品質ゲートは無い（憲章「リリースは main から行う」）。
+#
+# 報告のみのジョブ、検査を飛ばす入力、continue-on-error は置かない。
+# 新しい脆弱性の公表によって脆弱性を含まない変更が止まることはあるが、
+# その場合の対処は依存の更新、または脆弱な経路へ到達しない形への修正で
+# あって、ゲートの迂回ではない（憲章 MUST NOT）。
+
+name: govulncheck
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 版は CI では持たない。Makefile が唯一の出典である。
+      - name: Read pinned tool version
+        id: versions
+        run: |
+          value=$(make --no-print-directory print-GOVULNCHECK_VERSION)
+          if [ -z "$value" ]; then
+            echo "::error::Makefile から GOVULNCHECK_VERSION を読み取れませんでした"
+            exit 1
+          fi
+          echo "GOVULNCHECK_VERSION=$value" >> "$GITHUB_OUTPUT"
+
+      - name: Install govulncheck
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${{ steps.versions.outputs.GOVULNCHECK_VERSION }}"
+
+      # 失敗させる。到達可能な既知脆弱性を抱えた変更を統合しないため。
+      - name: Check reachable known vulnerabilities
+        run: make check-vuln
+
+      # 落ちたときに次の一手が分かるようにする。
+      # 迂回の手段は案内しない（存在しない）。
+      - name: How to fix
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'SUMMARY'
+          到達可能な既知脆弱性が報告された。次のいずれかで対処すること。
+
+          - 依存を修正版へ更新する（`go get <module>@<修正版>` のあと `go mod tidy`）
+          - 脆弱な経路へ到達しない形にコードを修正する
+
+          検査の迂回、一時的な無効化、報告のみへの格下げでは通せない。
+          コード変更と無関係な新しい脆弱性の公表によって止まった場合も、対処は同じである。
+
+          手元では `make check-vuln` で同じ検査が走る。
+          SUMMARY

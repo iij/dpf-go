@@ -1,6 +1,6 @@
-//go:build integration
-
 // SPDX-License-Identifier: Apache-2.0
+
+//go:build integration
 
 package integration
 
@@ -283,8 +283,9 @@ func apiErrorOf(err error) (*dpf.GenericOpenAPIError, bool) {
 
 // errorDetails は API エラーから error_details（エラーコードと対象属性）を取り出す。
 //
-// CLAUDE.md 仕様 7 の「APIのレスポンスからエラーコードやメッセージを抽出して
-// 格納する」が実際に機能しているかを確認するために使う。
+// specs/002-openapi-generation-pipeline/spec.md の FR-019・FR-020「エラー応答を
+// ステータスごとの型へ復号し、利用者が取り出せる形で保持する」が実際に機能して
+// いるかを確認するために使う。
 func errorDetails(err error) []dpf.ErrorDetail {
 	apiErr, ok := apiErrorOf(err)
 	if !ok {

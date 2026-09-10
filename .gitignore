@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Claude Code
-.claude
+.claude/*
+!.claude/skills/
+!.claude/commands/
+!.claude/agents/
+!.claude/settings.json
 
 # Go build artifacts / compiled binaries
 *.exe

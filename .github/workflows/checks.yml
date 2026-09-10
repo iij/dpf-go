@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# 統合前の品質ゲート。憲章「開発ワークフローと品質ゲート」のマージ前の表に
+# 対応する検査のうち、ファイル冒頭の規約・依存ライセンス・整形と静的解析を
+# 実行する。脆弱性検査は govulncheck.yml、シークレット検査は betterleaks.yml。
+#
+# 版は CI では持たない。Makefile が唯一の出典であり、ここは make ターゲットを
+# 呼ぶだけにする。両者に版があると必ず乖離し、指摘が「環境の差」として
+# 扱われてツールの判断が信頼されなくなる。
+#
+# continue-on-error は使わない。失敗を成功に見せてしまうため。
+# 検査を省略した場合は、その理由をログと実行サマリに残す。
+
+name: checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Makefile の固定値を読み出す。ここで版を書かないこと。
+      - name: Read pinned tool versions
+        id: versions
+        run: |
+          for v in GOLANGCI_LINT_VERSION GO_LICENSES_VERSION; do
+            value=$(make --no-print-directory print-$v)
+            if [ -z "$value" ]; then
+              echo "::error::Makefile から $v を読み取れませんでした"
+              exit 1
+            fi
+            echo "$v=$value" >> "$GITHUB_OUTPUT"
+          done
+
+      # ファイル冒頭の規約は外部ツールに依存しないため、先に実行して
+      # 早く失敗させる。
+      - name: Check file header conventions
+        run: make check-headers
+
+      # ビルドと単体テストも憲章のマージ前ゲートである。外部ツールの導入より
+      # 前に置いて、壊れたビルドで時間を使わないようにする。
+      - name: Build all modules
+        run: make build-all
+
+      # 単体テストはネットワークアクセスを必要としない（憲章 原則 II）。
+      # 実 API と権威 DNS サーバを使う統合テストは integration ビルドタグで
+      # 隔離されており、ここでは走らない（integration ワークフローが担当）。
+      - name: Run unit tests
+        run: make test
+
+      - name: Install golangci-lint
+        run: |
+          version="${{ steps.versions.outputs.GOLANGCI_LINT_VERSION }}"
+          # 公式のリリースバイナリを版指定で入れる。go install は使わない。
+          # ビルドに使う Go の版で結果が変わりうるため、golangci-lint 自身が
+          # 推奨していない。
+          curl -sSfL \
+            "https://github.com/golangci/golangci-lint/releases/download/v${version}/golangci-lint-${version}-linux-amd64.tar.gz" \
+            | tar -xz --strip-components=1 -C /usr/local/bin "golangci-lint-${version}-linux-amd64/golangci-lint"
+          golangci-lint --version
+
+      - name: Check formatting and static analysis
+        run: make check-lint
+
+      - name: Install go-licenses
+        run: |
+          go install "github.com/google/go-licenses/v2@${{ steps.versions.outputs.GO_LICENSES_VERSION }}"
+
+      - name: Check dependency licenses
+        run: make check-licenses
+
+      # 検査が省略された場合に「成功に見える」ことを防ぐ。
+      # 省略はここに残す（憲章 FR-026 相当）。
+      - name: Report skipped checks
+        if: always()
+        run: |
+          {
+            echo "### 統合前チェックの実行結果"
+            echo
+            echo "| 検査 | コマンド |"
+            echo "|---|---|"
+            echo "| ファイル冒頭の規約 | \`make check-headers\` |"
+            echo "| ビルド | \`make build-all\` |"
+            echo "| 単体テスト | \`make test\` |"
+            echo "| 整形・静的解析 | \`make check-lint\` |"
+            echo "| 依存ライセンス | \`make check-licenses\` |"
+            echo
+            echo "版は Makefile が唯一の出典。golangci-lint \`${{ steps.versions.outputs.GOLANGCI_LINT_VERSION }}\` / go-licenses \`${{ steps.versions.outputs.GO_LICENSES_VERSION }}\`。"
+            echo
+            echo "脆弱性検査は \`govulncheck\` ワークフロー、シークレット検査は \`betterleaks\` ワークフローで実行する。"
+            echo
+            echo "憲章のマージ前 7 ゲートのうち、上表の 5 つを本ワークフローが担う。"
+          } >> "$GITHUB_STEP_SUMMARY"

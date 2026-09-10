@@ -16,11 +16,12 @@ test/**
 
 # プロジェクト管理 / 生成設定ファイル（再生成で上書きしない）
 LICENSE
+.golangci.yml
+licenses-allowlist.txt
 NOTICE
 CHANGELOG.md
 .github/**
 Makefile
-CLAUDE.md
 README.md
 openapi.json
 openapi-generator-config.yaml
@@ -36,3 +37,7 @@ utils/**
 misc/**
 tools/**
 templates/**
+
+# 仕様・憲章（再生成で触れない）
+specs/**
+.specify/**

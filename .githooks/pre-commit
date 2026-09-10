@@ -13,16 +13,17 @@
 set -eu
 
 # git worktree や GIT_WORK_TREE 経由でも作業ツリーの最上位で走らせる。
-# 設定ファイル .gitleaks.toml と .gitleaksignore はそこにある。
+# 設定ファイル .betterleaks.toml と .betterleaksignore はそこにある。
 cd "$(git rev-parse --show-toplevel)"
 
-if ! command -v gitleaks >/dev/null 2>&1; then
+if ! command -v betterleaks >/dev/null 2>&1; then
 	cat >&2 <<'EOF'
-gitleaks が見つからないため、シークレット検査ができない。
+betterleaks が見つからないため、シークレット検査ができない。
 検査せずに通すと hook の意味が無くなるので、コミットを中断する。
 
-  導入: https://github.com/gitleaks/gitleaks#installing
-        （CI と同じ v8 系を使うこと。make gitleaks で同じ検査が走る）
+  導入: go install github.com/betterleaks/betterleaks@"$(make print-BETTERLEAKS_VERSION)"
+        （版は Makefile の BETTERLEAKS_VERSION が唯一の出典。
+          make betterleaks で同じ検査が走る）
   回避: git commit --no-verify
 EOF
 	exit 1
@@ -36,4 +37,4 @@ fi
 # --verbose は付ける。付けないと「leaks found: 1」しか出ず、どのファイルの
 # 何行目が引っかかったのか分からない。出力先が本人の端末だけなので、
 # ファイル・行・ルール ID を出しても差し支えない（CI では付けない）。
-exec gitleaks git . --staged --redact --verbose --no-banner --exit-code 1
+exec betterleaks git . --staged --redact --verbose --no-banner --exit-code 1

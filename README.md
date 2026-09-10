@@ -96,22 +96,60 @@ DPF-API 自体の仕様は [DPF-API リファレンスマニュアル](https://m
 
 ```bash
 make install-hooks # git hook を有効化する（clone 直後に一度）
-make build-all     # 全モジュールのビルド
-make test          # 全モジュールの単体テスト（ネットワーク不要）
-make lint          # golangci-lint
-make gitleaks      # シークレットの混入検査（履歴と作業ツリー）
+make check         # 変更を main へ入れる前に満たすべき検査をすべて実行する
 make generate      # openapi.json から api/model を再生成（Docker が必要）
 ```
 
+### 統合前の検査
+
+`make check` が、変更を `main` へ入れる前に満たすべき検査をまとめて実行します。
+提出前にこれ 1 つを実行してください。1 つが失敗しても残りを実行し、最後にまとめて
+報告します。個別に実行することもできます。
+
+| 検査 | コマンド | 対象 |
+|---|---|---|
+| ビルド | `make build-all` | リポジトリ内のすべてのモジュール |
+| 単体テスト | `make test` | 同（`-race -count=1`、ネットワーク不要） |
+| 整形・静的解析 | `make check-lint` | 同（`--build-tags=integration`） |
+| ファイル冒頭の規約 | `make check-headers` | すべての Go ファイル（テスト・生成物を含む） |
+| 依存ライセンス | `make check-licenses` | 同モジュールの依存 |
+| 到達可能な既知脆弱性 | `make check-vuln` | 同モジュールの依存 |
+| シークレットの混入 | `make betterleaks` | 履歴と作業ツリー |
+
+検査対象のモジュールは `go.mod` の位置から導出しています。モジュールを増やしても
+`Makefile` を書き換える必要はありません。
+
+必要なツールは `golangci-lint`、`go-licenses`、`govulncheck` です。版は `Makefile`
+の変数が唯一の出典で、CI も同じ値を使います。導入済みの版が違う場合、検査は
+省略されず中断します。手元と CI で指摘が食い違うと、指摘が「環境の差」として
+扱われてツールの判断が信頼されなくなるためです。
+
+検査はいずれも作業ツリーを書き換えません。整形の是正は `make fmt` で行います。
+
+**ファイル冒頭の規約**は 2 つあります。すべての Go ファイルの先頭行が
+`// SPDX-License-Identifier: Apache-2.0` であること、および `package` 宣言より前に
+`nolint` を置かないこと（この位置の指示はファイル全体に効くため）です。
+
+**依存ライセンス**は [licenses-allowlist.txt](licenses-allowlist.txt) の許容リストと
+照合します。判定の対象は実際に import されるパッケージです。リストに無いライセンス、
+判別できないライセンス、およびソース提供義務を伴うライセンス（MPL-2.0）が本体
+モジュールに現れた場合は失敗します。リストへの追加は個別の判断で行わないでください。
+
+**到達可能な既知脆弱性**があると `main` へマージできません。新しい脆弱性の公表は
+コード変更と無関係に起きるため、脆弱性を含まない変更が止まることがあります。その
+場合の対処は依存の更新（`go get <module>@<修正版>` のあと `go mod tidy`）、または
+脆弱な経路へ到達しない形への修正です。検査を飛ばす手段は用意していません。
+
 ### シークレットの混入検査
 
-[gitleaks](https://github.com/gitleaks/gitleaks) で三段構えに検査しています。
+[betterleaks](https://github.com/betterleaks/betterleaks) で三段構えに検査しています。
+`make check` からも実行されます。
 
 | 段 | 実体 | 走査対象 |
 |---|---|---|
 | コミット時 | [.githooks/pre-commit](.githooks/pre-commit) | ステージした変更 |
 | push 時 | [.githooks/pre-push](.githooks/pre-push) | リモートにまだ無いコミットの履歴 |
-| CI | [.github/workflows/gitleaks.yml](.github/workflows/gitleaks.yml) | 履歴全体と作業ツリー |
+| CI | [.github/workflows/betterleaks.yml](.github/workflows/betterleaks.yml) | 履歴全体と作業ツリー |
 
 git は clone で hook を持ってこないため、clone 直後に一度だけ有効化してください。
 `core.hooksPath` をリポジトリ管理の `.githooks/` に向けます（グローバルの
@@ -121,17 +159,17 @@ git は clone で hook を持ってこないため、clone 直後に一度だけ
 make install-hooks
 ```
 
-hook は最後の砦なので、gitleaks が入っていなければ検査せず通すのではなく
+hook は最後の砦なので、betterleaks が入っていなければ検査せず通すのではなく
 中断します。急ぎで飛ばす必要があれば `git commit --no-verify` /
 `git push --no-verify` を使えますが、その場合も CI で必ず検査されます。
-`main` へのマージには CI の `gitleaks` の成功が必須です。
+`main` へのマージには CI の `betterleaks` の成功が必須です。
 
-CI が落ちた場合は、手元で `make gitleaks` を実行して内容を確認してください。
+CI が落ちた場合は、手元で `make betterleaks` を実行して内容を確認してください。
 
 検出されたものが本物だった場合は、**まずトークンを失効・再発行してください**。
 履歴から消しても、一度 push された値は漏洩したものとして扱う必要があります。
 
-誤検知の除外は [.gitleaks.toml](.gitleaks.toml) に定義しています。
+誤検知の除外は [.betterleaks.toml](.betterleaks.toml) に定義しています。
 除外を追加する場合は、なぜシークレットでないのかを `description` に必ず記載してください。
 
 実際の DPF-API と権威 DNS サーバを使う統合テストは、`integration` ビルドタグで
