@@ -287,3 +287,18 @@ Task: "tools/checklicenses/doc.go を作成"
 - 検査ターゲットは作業ツリーを書き換えない。書き換えるのは既存の `make fmt` のみ（FR-028）
 - 「検査できなかった」を「違反なし」として扱ってはならない。終了コード 2 を 1 と混同しない
 - 4 種すべてが統合を止めるゲートである。報告のみの経路や迂回を実装してはならない（FR-021, FR-022）
+
+---
+
+## フェーズ 8: 収束 (Convergence)
+
+**目的**: 実装後にコードを spec・plan・tasks へ照らして評価し、残っていた差分を埋める。
+`/speckit-converge` が検出した 5 件で、憲章違反は無い。
+
+- [X] T049 `tools/checklicenses/verdict.go` の `verdictOf` が SPDX の複合式（`MIT OR Apache-2.0`、`Apache-2.0 AND BSD-3-Clause`）を解釈できるようにする。`OR` は許容リストに収まる選択肢が一つでもあれば許容とし、選択したライセンスを報告に残す。`AND` はすべてが許容リストに収まる場合のみ許容とする。現在は単純な map 参照のため複合式が `disallowed` になり、マージを止める偽陽性になる per spec: 境界的な状況（デュアルライセンス） (missing)
+- [X] T050 `tools/checklicenses/why_test.go` に `why` の出力解析のテーブル駆動テストを作成する。`go mod why` の出力（コメント行、`(main module does not need ...)` の行、import の連鎖、空出力）を網羅し、経由元の抽出と特定できない場合の扱いを固定する。上流の出力形式に依存する箇所であり、現在のカバレッジは 0.0% per FR-010 / 憲章 II (partial)
+- [X] T051 `tools/checkheaders/check_test.go` と `tools/checklicenses/main_test.go` に出力 1 行の形式のテストを追加する。`violation.String()` が `パス<TAB>種別<TAB>詳細`、`format()` が `モジュール<TAB>パッケージ<TAB>区分<TAB>ライセンス<TAB>詳細` を返すことを固定する。contracts/gates.md が機械的に読める形を契約として定めているのに、現在はいずれもカバレッジ 0.0% per contracts/gates.md: 出力の契約 / 憲章 II (partial)
+- [X] T052 `tools/checkheaders/run` と `tools/checklicenses/run` にテストを追加する。前者は一時ディレクトリを作り、隠しディレクトリ・`vendor`・`testdata` が除外されること、生成物とテストファイルは除外されないこと、違反が全件パス順に並ぶことを確認する。後者は `reciprocal` が終了コードに影響せず一覧として出ること、違反があれば 1 を返すことを確認する。いずれも現在のカバレッジは 0.0% per FR-002, FR-003, FR-004, FR-009, FR-011, FR-012 / 憲章 II (partial)
+- [X] T053 `make generate` の実行後に `make check-headers` が 0 件で通ることを確認した。**再生成による差分は 0 件**で、生成物 7 種（`api_*` / `model_*` / `client` / `configuration` / `response` / `utils` / `executeall_gen`）の先頭行はいずれも SPDX 識別子だった。T015 で機構の確認に留めていた部分を実測で埋めた per FR-006 (partial)
+
+**Checkpoint**: 判定ロジックだけでなく入出力と走査の層も検証され、複合式の偽陽性が解消する
