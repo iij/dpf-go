@@ -118,6 +118,36 @@ func TestRun(t *testing.T) {
 	}
 }
 
+// TestRunSortsByKindWithinSamePath は、同じファイルから 2 種類の違反が出た場合の
+// 並びを固定する。パスが同じときは種別で並べており、出力を実行ごとに変えない。
+func TestRunSortsByKindWithinSamePath(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// SPDX が無く、かつ package 宣言より前に nolint がある。2 件の違反が出る。
+	body := "//nolint:errcheck // 理由\n\npackage a\n"
+	if err := os.WriteFile(filepath.Join(root, "both.go"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	violations, err := run(root)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(violations) != 2 {
+		t.Fatalf("2 件の違反が出ること: got %d 件 (%v)", len(violations), violations)
+	}
+	for _, v := range violations {
+		if v.Path != "both.go" {
+			t.Errorf("パスが違う: got %q", v.Path)
+		}
+	}
+	// "missing-spdx" < "preamble-pragma" の順に並ぶ。
+	if violations[0].Kind != kindMissingSPDX || violations[1].Kind != kindPreamblePragma {
+		t.Errorf("種別の並びが違う: got %q, %q", violations[0].Kind, violations[1].Kind)
+	}
+}
+
 // TestRunMissingRoot は走査できない場合にエラーを返すことを確認する。
 // 「検査できなかった」を「違反なし」として扱ってはならない。
 func TestRunMissingRoot(t *testing.T) {

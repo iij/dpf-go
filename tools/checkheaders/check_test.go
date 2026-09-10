@@ -123,6 +123,10 @@ func TestSkipPath(t *testing.T) {
 		// vendor / testdata で始まるだけの名前は除外しない
 		{filepath.Join("vendored", "x.go"), false},
 		{filepath.Join("testdata_helper", "x.go"), false},
+		// バックスラッシュは区切りとして扱わない。呼び出し側が ToSlash で
+		// 正規化するため残らず、Linux では正当なファイル名の文字である。
+		{`foo\vendor\bar.go`, false},
+		{`testdata\x.go`, false},
 	}
 
 	for _, tt := range tests {
