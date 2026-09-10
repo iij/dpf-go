@@ -5,6 +5,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -45,7 +46,7 @@ func main() {
 //
 // 判定と解析は allowlist.go / input.go / verdict.go に委ね、ここでは
 // 入出力の接続だけを行う。
-func run(module, allowPath string, stdin *os.File, stdout *os.File) (int, error) {
+func run(module, allowPath string, stdin io.Reader, stdout io.Writer) (int, error) {
 	f, err := os.Open(allowPath)
 	if err != nil {
 		return 0, fmt.Errorf("許容リストを開けません: %w", err)
@@ -67,12 +68,17 @@ func run(module, allowPath string, stdin *os.File, stdout *os.File) (int, error)
 
 	var violations, reciprocals []string
 	for _, rec := range records {
-		v := verdictOf(rec.LicenseID, isRoot, allow)
+		// selected は報告に残すライセンス。複合式で OR の選択が生じた場合は
+		// 選んだ側になるため、記録にはこちらを使う。
+		v, selected := verdictOf(rec.LicenseID, isRoot, allow)
+		reported := rec
+		reported.LicenseID = selected
+
 		switch {
 		case v.isViolation():
-			violations = append(violations, format(module, rec, v, why(module, rec.Package)))
+			violations = append(violations, format(module, reported, v, why(module, rec.Package)))
 		case v == verdictAllowedReciprocal:
-			reciprocals = append(reciprocals, format(module, rec, v, "ソース提供義務あり。終了コードには影響しない"))
+			reciprocals = append(reciprocals, format(module, reported, v, "ソース提供義務あり。終了コードには影響しない"))
 		}
 	}
 
@@ -122,9 +128,16 @@ func why(module, pkg string) string {
 	if err != nil {
 		return "経由元を特定できませんでした（go mod why " + pkg + " を手元で実行してください）"
 	}
+	return parseWhy(out)
+}
 
-	// go mod why はコメント行（#）と、import の連鎖を出す。
-	// 連鎖のうち最初の 2 つが「起点」と「経由した直接依存」である。
+// parseWhy は go mod why の出力から経由元の説明を組み立てる。
+//
+// 出力の形式に依存する箇所であるため、コマンドの実行から切り離してテストできる
+// ようにしている。go mod why はモジュールごとに、コメント行（#）に続けて import の
+// 連鎖を出す。連鎖のうち最初の 2 つが「起点」と「経由した直接依存」である。
+// パッケージが不要な場合は括弧で囲んだ説明が出るため、これも読み飛ばす。
+func parseWhy(out []byte) string {
 	var chain []string
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
