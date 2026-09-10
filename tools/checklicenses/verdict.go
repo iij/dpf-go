@@ -102,8 +102,15 @@ func evaluate(expr string, allow map[string]obligation) (obligation, string, boo
 		return "", "", false
 	}
 
+	// 式は「被演算子 演算子 被演算子 ...」と交互に並び、被演算子で終わる。
+	// したがって語数は必ず奇数になる。偶数なら演算子で終わっているか
+	// 被演算子が欠けており、式として不完全である。
+	//
+	// ここを見ないと `MIT AND` のような不完全な式で被演算子が 1 つだけ残り、
+	// 演算子を無視して単一のライセンスとして許容してしまう。`A AND B` が
+	// 途中で切れた入力では B の義務が落ちるため、判定が実際より緩くなる。
 	fields := strings.Fields(expr)
-	if len(fields) == 0 {
+	if len(fields) == 0 || len(fields)%2 == 0 {
 		return "", "", false
 	}
 
@@ -139,9 +146,7 @@ func evaluate(expr string, allow map[string]obligation) (obligation, string, boo
 		operands = append(operands, f)
 	}
 
-	if len(operands) == 0 || len(operands) != (len(fields)+1)/2 {
-		return "", "", false
-	}
+	// 語数が奇数で交互に並ぶことを検証済みのため、被演算子は (語数+1)/2 個ある。
 	if len(operands) == 1 {
 		ob, ok := allow[operands[0]]
 		if !ok {
