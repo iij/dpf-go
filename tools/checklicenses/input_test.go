@@ -69,6 +69,18 @@ func TestParseRecords(t *testing.T) {
 			src:     "",
 			wantErr: "空",
 		},
+		{
+			// csv は空行を返さないが、引用符だけの行は 1 列として返す。
+			// 列数の異なる行は無視せず中断する（契約）。
+			name:    "引用符だけの行は 1 列としてエラー",
+			src:     "\"\"\n",
+			wantErr: "3 列",
+		},
+		{
+			name:    "正常な行に混ざった 1 列の行もエラー",
+			src:     "a/b,https://x/L,MIT\n\"\"\nc/d,https://y/L,MIT\n",
+			wantErr: "3 列",
+		},
 	}
 
 	for _, tt := range tests {

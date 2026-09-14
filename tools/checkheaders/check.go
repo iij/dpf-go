@@ -42,14 +42,13 @@ func (v violation) String() string {
 // vendor と testdata の配下を除外する。パス要素として一致した場合のみ
 // 除外するため、vendored や testdata_helper のようなディレクトリは
 // 除外されない。
+//
+// 区切りは "/" だけを見る。呼び出し側が filepath.ToSlash で正規化してから
+// 渡すため、Windows でも "\\" は残らない。逆に Linux では "\\" は正当な
+// ファイル名の文字であり、区切りとして扱うと foo\\vendor\\bar.go という
+// 1 つのファイル名を誤って除外してしまう。
 func skipPath(path string) bool {
 	for _, elem := range strings.Split(path, "/") {
-		if elem == "vendor" || elem == "testdata" {
-			return true
-		}
-	}
-	// Windows 由来の区切りが混ざった場合にも同じ判定をする。
-	for _, elem := range strings.Split(path, "\\") {
 		if elem == "vendor" || elem == "testdata" {
 			return true
 		}

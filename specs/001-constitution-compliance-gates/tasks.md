@@ -287,3 +287,44 @@ Task: "tools/checklicenses/doc.go を作成"
 - 検査ターゲットは作業ツリーを書き換えない。書き換えるのは既存の `make fmt` のみ（FR-028）
 - 「検査できなかった」を「違反なし」として扱ってはならない。終了コード 2 を 1 と混同しない
 - 4 種すべてが統合を止めるゲートである。報告のみの経路や迂回を実装してはならない（FR-021, FR-022）
+
+---
+
+## フェーズ 8: 収束 (Convergence)
+
+**目的**: 実装後にコードを spec・plan・tasks へ照らして評価し、残っていた差分を埋める。
+`/speckit-converge` が検出した 5 件で、憲章違反は無い。
+
+- [X] T049 `tools/checklicenses/verdict.go` の `verdictOf` が SPDX の複合式（`MIT OR Apache-2.0`、`Apache-2.0 AND BSD-3-Clause`）を解釈できるようにする。`OR` は許容リストに収まる選択肢が一つでもあれば許容とし、選択したライセンスを報告に残す。`AND` はすべてが許容リストに収まる場合のみ許容とする。現在は単純な map 参照のため複合式が `disallowed` になり、マージを止める偽陽性になる per spec: 境界的な状況（デュアルライセンス） (missing)
+- [X] T050 `tools/checklicenses/why_test.go` に `why` の出力解析のテーブル駆動テストを作成する。`go mod why` の出力（コメント行、`(main module does not need ...)` の行、import の連鎖、空出力）を網羅し、経由元の抽出と特定できない場合の扱いを固定する。上流の出力形式に依存する箇所であり、現在のカバレッジは 0.0% per FR-010 / 憲章 II (partial)
+- [X] T051 `tools/checkheaders/check_test.go` と `tools/checklicenses/main_test.go` に出力 1 行の形式のテストを追加する。`violation.String()` が `パス<TAB>種別<TAB>詳細`、`format()` が `モジュール<TAB>パッケージ<TAB>区分<TAB>ライセンス<TAB>詳細` を返すことを固定する。contracts/gates.md が機械的に読める形を契約として定めているのに、現在はいずれもカバレッジ 0.0% per contracts/gates.md: 出力の契約 / 憲章 II (partial)
+- [X] T052 `tools/checkheaders/run` と `tools/checklicenses/run` にテストを追加する。前者は一時ディレクトリを作り、隠しディレクトリ・`vendor`・`testdata` が除外されること、生成物とテストファイルは除外されないこと、違反が全件パス順に並ぶことを確認する。後者は `reciprocal` が終了コードに影響せず一覧として出ること、違反があれば 1 を返すことを確認する。いずれも現在のカバレッジは 0.0% per FR-002, FR-003, FR-004, FR-009, FR-011, FR-012 / 憲章 II (partial)
+- [X] T053 `make generate` の実行後に `make check-headers` が 0 件で通ることを確認した。**再生成による差分は 0 件**で、生成物 7 種（`api_*` / `model_*` / `client` / `configuration` / `response` / `utils` / `executeall_gen`）の先頭行はいずれも SPDX 識別子だった。T015 で機構の確認に留めていた部分を実測で埋めた per FR-006 (partial)
+
+**Checkpoint**: 判定ロジックだけでなく入出力と走査の層も検証され、複合式の偽陽性が解消する
+
+---
+
+## フェーズ 9: 収束 (Convergence, 2 回目)
+
+**目的**: フェーズ 8 の実装後に再評価した結果、複合式の解釈に緩い経路が残っていた。
+`/speckit-converge` が検出した 4 件で、憲章違反は無い。
+
+- [X] T054 `tools/checklicenses/verdict.go` の `evaluate` で、末尾に演算子だけが残る不完全な式（`MIT AND`、`MIT OR`）を判別不能として扱う。現在は被演算子が 1 つになると演算子を無視して単一ライセンスとして許容し、実測で `verdictOf("MIT AND")` が `allowed` / 報告 `MIT` を返す。`A AND B` が途中で切れた入力では B の義務が落ちるため判定が実際より緩くなる。解釈できない形は判別不能へ倒す方針に反する。`verdict_test.go` にケースを追加して固定する per spec: 境界的な状況（デュアルライセンス） (partial)
+- [X] T055 `specs/001-constitution-compliance-gates/data-model.md` の Verdict 節と `contracts/gates.md` を、複合式の解釈と「選択したライセンスの報告」に合わせて更新する。現在の判定表は `LicenseID` が単一の識別子である前提で書かれており、`OR` で選択が生じた場合に報告へ残すライセンスが入力と異なることも、`AND` で義務が最も重いものになることも記述されていない per spec: 境界的な状況（デュアルライセンス） / contracts: Verdict (partial)
+- [X] T056 `tools/checkheaders/check.go` の `skipPath` からバックスラッシュを区切りとする分岐を削除する。`main.go` が `filepath.ToSlash` で正規化してから呼ぶため到達不能であり、Windows でも ToSlash が変換する。加えて Linux では `\` が正当なファイル名文字であるため、`foo\vendor\bar.go` という 1 つのファイル名を誤って除外しうる。削除しない場合は到達する経路を示すコメントを残す per plan: checkheaders の走査 (unrequested)
+- [X] T057 未テストの 2 分岐にテストを追加する。`tools/checkheaders/main.go` の `run()` の並び替えのタイブレーク（同一パスで `missing-spdx` と `preamble-pragma` の 2 件が出る場合の順序）と、`tools/checklicenses/verdict.go` の `evaluate` の空フィールド分岐（空白のみのライセンス識別子。実測では `undetermined` を返す） per FR-004 / 憲章 II (partial)
+
+**Checkpoint**: 複合式の解釈に緩い経路が残らず、設計文書が実装と一致する
+
+---
+
+## フェーズ 10: 収束 (Convergence, 3 回目)
+
+**目的**: フェーズ 9 の実装後に再評価した結果、入力の契約に反するガードが 1 件残っていた。
+`/speckit-converge` が検出した 2 件で、憲章違反は無い。
+
+- [X] T058 `tools/checklicenses/input.go` の「1 列で内容が空の行を飛ばす」ガードを削除する。契約は列数の異なる行を検査不能として中断すると定めており、無視してはならない。実測で `""` の行は csv が `[""]`（1 列）として返すため、このガードに落ちて列数のエラーに到達しない。コメントが述べるとおり空行は csv が返さないので、ガードは不要なうえに不正な行を飲み込む。削除後に `""` の行がエラーになることを `input_test.go` で固定する per contracts/gates.md: 入力の契約 (contradicts)
+- [X] T059 `tools/checkheaders/check_test.go` に、`package` 宣言を持たない `.go` ファイル（空ファイル、コメントのみのファイル）のケースを追加する。`preamblePragmaLine` の最終 return が未カバーであり、現実的な入力経路がある per FR-018 / 憲章 II (partial)
+
+**Checkpoint**: 入力の契約に例外が残らず、走査の分岐がすべて検証される

@@ -87,6 +87,23 @@ func TestCheckFile(t *testing.T) {
 			src:  spdx + "\n// nolint の扱いについての説明\n\npackage foo\n",
 			want: nil,
 		},
+		{
+			// package 宣言まで走査しても見つからない場合の経路。
+			// 空の .go ファイルやコメントだけのファイルで到達する。
+			name: "package 宣言が無い空のファイルは SPDX 欠落だけを報告する",
+			src:  "",
+			want: []violationKind{kindMissingSPDX},
+		},
+		{
+			name: "package 宣言が無くコメントだけのファイルも SPDX 欠落だけを報告する",
+			src:  spdx + "\n// 説明だけのファイル\n",
+			want: nil,
+		},
+		{
+			name: "package 宣言が無くても広域 nolint は検出する",
+			src:  spdx + "\n//nolint:errcheck // 理由\n",
+			want: []violationKind{kindPreamblePragma},
+		},
 	}
 
 	for _, tt := range tests {
@@ -123,6 +140,10 @@ func TestSkipPath(t *testing.T) {
 		// vendor / testdata で始まるだけの名前は除外しない
 		{filepath.Join("vendored", "x.go"), false},
 		{filepath.Join("testdata_helper", "x.go"), false},
+		// バックスラッシュは区切りとして扱わない。呼び出し側が ToSlash で
+		// 正規化するため残らず、Linux では正当なファイル名の文字である。
+		{`foo\vendor\bar.go`, false},
+		{`testdata\x.go`, false},
 	}
 
 	for _, tt := range tests {

@@ -25,6 +25,10 @@ type record struct {
 // エラーとする。空の識別子を判別不能として黙って通すと、判定の根拠が
 // 分からなくなる（判別不能であることは "Unknown" が明示する）。
 //
+// 空行を飛ばす分岐は置かない。csv は空行を読み飛ばすため不要であり、
+// 引用符だけの行（1 列で内容が空）を飛ばす副作用がある。それは列数の
+// 異なる行であり、契約上は中断しなければならない。
+//
 // 入力が 1 行も無い場合もエラーとする。対象を取り違えて空の入力を
 // 渡したことを「違反なし」として通さないため。
 func parseRecords(r io.Reader) ([]record, error) {
@@ -40,11 +44,6 @@ func parseRecords(r io.Reader) ([]record, error) {
 		}
 		if err != nil {
 			return nil, fmt.Errorf("%d 行目: 入力を読めませんでした: %w", line, err)
-		}
-
-		// csv は空行を返さないが、念のため空の行は飛ばす。
-		if len(fields) == 1 && fields[0] == "" {
-			continue
 		}
 
 		if len(fields) != 3 {

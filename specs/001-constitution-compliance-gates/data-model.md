@@ -81,18 +81,43 @@
 
 `Dependency` と `Allowlist` から導かれる判定。1 つの依存に 1 つ。
 
+判定は 2 つの値を返す。**判定そのもの**と、**報告に残すライセンス**である。
+後者は複合式で `OR` の選択が生じた場合に、入力の式ではなく選んだ側になる。
+
 | 値 | 条件 | ゲートへの影響 |
 |---|---|---|
-| `allowed` | `LicenseID` が `notice` として許容リストにある | 通す |
-| `allowed_reciprocal` | `LicenseID` が `reciprocal` として許容リストにあり、`OwnerModule` が本体でない | 通す。義務を伴う依存として報告する（FR-011） |
-| `violation_root_reciprocal` | `LicenseID` が `reciprocal` で `OwnerModule` が本体 | 失敗（FR-012） |
-| `violation_disallowed` | `LicenseID` が許容リストに無い | 失敗（FR-009） |
-| `violation_undetermined` | `LicenseID` が `Unknown` | 失敗（FR-009）。「許容」として扱わない |
+| `allowed` | 有効なライセンスが `notice` として許容リストにある | 通す |
+| `allowed_reciprocal` | 有効なライセンスが `reciprocal` として許容リストにあり、`OwnerModule` が本体でない | 通す。義務を伴う依存として報告する（FR-011） |
+| `violation_root_reciprocal` | 有効なライセンスが `reciprocal` で `OwnerModule` が本体 | 失敗（FR-012） |
+| `violation_disallowed` | 有効なライセンスが許容リストに無い | 失敗（FR-009） |
+| `violation_undetermined` | `LicenseID` が `Unknown`、または式を解釈できない | 失敗（FR-009）。「許容」として扱わない |
 
 **判定の順序**: `violation_undetermined` → `violation_disallowed` →
 `violation_root_reciprocal` → `allowed_reciprocal` → `allowed`。
 先に一致したものを採る。判別不能を最優先で見るのは、判別できないものを
 許容側へ倒さないためである。
+
+### 複合式の解釈
+
+`LicenseID` は単一の識別子だけでなく SPDX の複合式を取りうる。
+
+| 形 | 判定 | 報告に残すライセンス |
+|---|---|---|
+| `A`（単一） | 許容リストとの照合 | `A` |
+| `A OR B` | **収まる選択肢が一つでもあれば許容**。`notice` の側を優先する | **選んだ側** |
+| `A AND B` | **すべてが収まることを求める**。義務は最も重いものを採る | 式全体 |
+
+`OR` で `notice` を優先するのは、ソース提供義務を満たす手間を避けられるなら
+避けたいためである。`AND` は選択ではなく重畳なので、報告には式全体を残す。
+
+**解釈しない形は判別不能へ倒す。** 括弧、`AND` と `OR` の混在（優先順位が
+決まらない）、`WITH` による例外、`LicenseRef-`（参照先の内容が分からない）、
+`+`（or-later）、小文字の `and` / `or`、そして**演算子が末尾に残る不完全な式**
+（`MIT AND`）がこれに当たる。推測して通すと許容の範囲が実際より広くなる。
+
+式は「被演算子 演算子 被演算子 ...」と交互に並び被演算子で終わるため、語数は
+必ず奇数になる。偶数なら不完全な式である。ここを見ないと `MIT AND` で被演算子が
+1 つだけ残り、演算子を無視して単一のライセンスとして許容してしまう。
 
 ---
 

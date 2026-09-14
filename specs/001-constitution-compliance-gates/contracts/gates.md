@@ -68,6 +68,11 @@ MUST NOT としている。
 - 対象: 各モジュールが実際に import しているパッケージ（D2）
 - 違反の種別: `undetermined` / `disallowed` / `root-reciprocal`
   （[data-model.md](../data-model.md) の Verdict に対応）
+- ライセンスは単一の識別子だけでなく SPDX の複合式を取りうる。`OR` は収まる
+  選択肢が一つでもあれば許容し、**選んだ側を報告に残す**（入力の式ではない）。
+  `AND` はすべてが収まることを求め、義務は最も重いものを採る。解釈しない形
+  （括弧、`AND` と `OR` の混在、`WITH`、`LicenseRef-`、`+`、末尾に演算子が
+  残る不完全な式）は `undetermined` として失敗する
 - 報告: 違反が無い場合も、`reciprocal` の依存の一覧を出す（FR-011）。
   この一覧は終了コードに影響しない
 - 出力例:
