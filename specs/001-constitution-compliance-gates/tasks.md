@@ -316,3 +316,15 @@ Task: "tools/checklicenses/doc.go を作成"
 - [X] T057 未テストの 2 分岐にテストを追加する。`tools/checkheaders/main.go` の `run()` の並び替えのタイブレーク（同一パスで `missing-spdx` と `preamble-pragma` の 2 件が出る場合の順序）と、`tools/checklicenses/verdict.go` の `evaluate` の空フィールド分岐（空白のみのライセンス識別子。実測では `undetermined` を返す） per FR-004 / 憲章 II (partial)
 
 **Checkpoint**: 複合式の解釈に緩い経路が残らず、設計文書が実装と一致する
+
+---
+
+## フェーズ 10: 収束 (Convergence, 3 回目)
+
+**目的**: フェーズ 9 の実装後に再評価した結果、入力の契約に反するガードが 1 件残っていた。
+`/speckit-converge` が検出した 2 件で、憲章違反は無い。
+
+- [X] T058 `tools/checklicenses/input.go` の「1 列で内容が空の行を飛ばす」ガードを削除する。契約は列数の異なる行を検査不能として中断すると定めており、無視してはならない。実測で `""` の行は csv が `[""]`（1 列）として返すため、このガードに落ちて列数のエラーに到達しない。コメントが述べるとおり空行は csv が返さないので、ガードは不要なうえに不正な行を飲み込む。削除後に `""` の行がエラーになることを `input_test.go` で固定する per contracts/gates.md: 入力の契約 (contradicts)
+- [X] T059 `tools/checkheaders/check_test.go` に、`package` 宣言を持たない `.go` ファイル（空ファイル、コメントのみのファイル）のケースを追加する。`preamblePragmaLine` の最終 return が未カバーであり、現実的な入力経路がある per FR-018 / 憲章 II (partial)
+
+**Checkpoint**: 入力の契約に例外が残らず、走査の分岐がすべて検証される
