@@ -87,6 +87,23 @@ func TestCheckFile(t *testing.T) {
 			src:  spdx + "\n// nolint の扱いについての説明\n\npackage foo\n",
 			want: nil,
 		},
+		{
+			// package 宣言まで走査しても見つからない場合の経路。
+			// 空の .go ファイルやコメントだけのファイルで到達する。
+			name: "package 宣言が無い空のファイルは SPDX 欠落だけを報告する",
+			src:  "",
+			want: []violationKind{kindMissingSPDX},
+		},
+		{
+			name: "package 宣言が無くコメントだけのファイルも SPDX 欠落だけを報告する",
+			src:  spdx + "\n// 説明だけのファイル\n",
+			want: nil,
+		},
+		{
+			name: "package 宣言が無くても広域 nolint は検出する",
+			src:  spdx + "\n//nolint:errcheck // 理由\n",
+			want: []violationKind{kindPreamblePragma},
+		},
 	}
 
 	for _, tt := range tests {
