@@ -20,6 +20,24 @@
 1 つの依存で揃う。既存の 4 モジュールがいずれも各サービスの公式 SDK を用いている
 (spec の前提) のに揃う。
 
+**保守上の制約 (2026-09-18 に実測して判明)**: **`k8s.io/*` と
+`sigs.k8s.io/structured-merge-diff` はリリース列車として揃って動くため、
+個別に更新してはならない。** `go get -u ./...` は `k8s.io/kube-openapi` を
+未リリースの次版 (v0.38 系) 向けのコミットへ上げ、`structured-merge-diff/v7` を
+連れてくる。`k8s.io/apimachinery v0.37.0` は v6 に対して構築されているため、
+ビルドが次のように失敗する。
+
+```text
+cannot use typeSchema.Types (variable of type []".../v7/schema".TypeDef)
+  as []".../v6/schema".TypeDef value in struct literal
+```
+
+`client-go` の安定版が v0.37.0 である間は、`k8s.io/kube-openapi` を
+`v0.0.0-20260721132016-d427ff9ee9ad` (client-go v0.37.0 の `go.mod` が要求する版) に
+保つこと。依存を一括更新した場合は、この 1 件を戻して `go mod tidy` を実行する。
+`client-go` 自体を上げるときは `k8s.io/api`・`k8s.io/apimachinery`・`kube-openapi`・
+`structured-merge-diff` を同じ列車の版へ揃えて動かす。
+
 **検討した代替案**:
 
 | 案 | 却下の理由 |

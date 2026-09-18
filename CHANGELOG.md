@@ -46,6 +46,9 @@
 
 ### Changed
 
+- 全 6 モジュールの依存を最新版へ更新した。`misc/gcp` の
+  `google.golang.org/grpc` は v1.82.1 から v1.84.0 になり、これにより
+  到達可能な既知脆弱性 GO-2026-6348 が解消した
 - `make lint` を `make check-lint` に改名。設定を `.golangci.yml` に固定し、
   整形の検査も同ターゲットが担うようにした。検査は作業ツリーを書き換えない
   （書き換えるのは `make fmt`）
