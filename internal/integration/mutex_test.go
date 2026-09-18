@@ -17,10 +17,13 @@ import (
 
 // ciLockOwner はロックの owner。
 //
-// 既定の owner はホスト名だが、CI ランナーのホスト名は実行ごとに変わるため、
-// 途中で異常終了するとロックが TTL の間どの実行からも取得できなくなる。
-// 固定の owner にしておくと utils.Mutex の「owner が自分自身ならロック可能」
-// という判定で短絡し、次の実行が自己回復できる。
+// 既定の owner はインスタンスごとに一意な値であり、ラベルを見ただけでは CI の実行と
+// 判別できない。固定の owner にしておくと、残っているラベルが CI 由来かどうかが分かる。
+//
+// 以前は「owner が自分自身ならロック可能」という判定で中断からの自己回復を得ていたが、
+// specs/006-zone-lock-redesign によりその判定は無くなった（同一 owner を持つ
+// プログラム同士が互いを排他できなくなるため）。中断からの回復は t.Cleanup の
+// discardSOAChanges、ロックの TTL の経過、一時レコード追加ロックの失効が担う。
 const ciLockOwner = "dpf-go-ci"
 
 // soaRecord はゾーンの SOA レコードをすべて返す（state 込み）。
@@ -46,9 +49,10 @@ func soaRecords(t *testing.T, ctx context.Context, c *utils.Client, zoneID strin
 
 // waitSOALabel は SOA のラベルが条件を満たすまで待つ。
 //
-// utils.Mutex の Lock / Unlock は内部の PatchRecord の AsyncResponse を
-// 破棄しており SyncWait できない。「非同期 JOB を重ねない」制約を守るため、
-// ラベルが実際に反映されるまでここで待つ必要がある。
+// utils.Mutex は内部の PatchRecord の AsyncResponse を破棄しており SyncWait できない。
+// Lock と Renew は書き込んだ内容が読み出せることを自分で確認してから復帰するため
+// 待機は不要だが、Unlock は確認しない。「非同期 JOB を重ねない」制約を守るため、
+// ラベルが実際に反映されるまでここで待つ。
 func waitSOALabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID string, cond func(map[string]string) bool, what string) {
 	t.Helper()
 
@@ -69,7 +73,26 @@ func waitSOALabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID str
 	}
 }
 
-// TestZoneMutex はゾーン単位ロックの取得・競合・解放を検証する。
+// soaLockDeadline は SOA レコードのロックの奪ってよい時刻を返す。
+func soaLockDeadline(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) int64 {
+	t.Helper()
+
+	for _, r := range soaRecords(t, ctx, c, zoneID) {
+		v, ok := r.Labels[utils.LockDeadlineLabelKey]
+		if !ok {
+			continue
+		}
+		d, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatalf("奪ってよい時刻 %q を解釈できない: %v", v, err)
+		}
+		return d
+	}
+	t.Fatal("SOA レコードにロックのラベルが無い")
+	return 0
+}
+
+// TestZoneMutex はゾーン単位ロックの取得・競合・延長・解放を検証する。
 //
 // ロックは SOA レコードの「編集予定」状態を利用しているため、反映して
 // しまうとロックとして機能しなくなる。このテストはゾーン反映を行わず、
@@ -81,9 +104,11 @@ func TestZoneMutex(t *testing.T) {
 
 	resetPendingChanges(t, ctx, c, zone.Id)
 
-	// 実測しないと分からない挙動なので記録に残す。GetRecordList が
-	// state 5（更新前の状態）の行も返すかどうかで、utils/lock.go の
-	// getSOA がスナップショット行を掴む可能性が変わる。
+	// GetRecordList が返す SOA の行を記録に残す。2026-09-18 の実測では、ロック前は
+	// state=0 の 1 行、ロック後は同じ ID の state=3 の 1 行のみで、state=5（更新前の
+	// 状態）の行は現れなかった。utils/lock.go の getSOA は state=3 を優先し、一意に
+	// 決まらない場合はエラーとするため、応答が変わっても古い行を掴むことはない。
+	// 応答が変わった場合はこのログで気づける。
 	for _, r := range soaRecords(t, ctx, c, zone.Id) {
 		t.Logf("ロック前の SOA: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
 	}
@@ -111,6 +136,18 @@ func TestZoneMutex(t *testing.T) {
 		t.Logf("ロック後の SOA: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
 	}
 
+	// 一時レコード追加ロックの専用レコードは、排他が取得できた時点で取り消される。
+	// 権威サーバへ公開されず、未反映としても残らない（SC-005、FR-009）。
+	if recs := lockRecords(t, ctx, c, zone.Id); len(recs) != 0 {
+		for _, r := range recs {
+			t.Logf("専用レコード: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
+		}
+		t.Errorf("取得後に専用レコード %s が %d 件残っている", lockRecordName(), len(recs))
+	}
+	if n := pendingCount(t, ctx, c, zone.Id); n != 1 {
+		t.Errorf("取得後の未反映件数が %d 件。SOA の 1 件だけであること", n)
+	}
+
 	// 別の owner はロックを奪えない。
 	other := utils.NewMutex(recordsAPI, zone.Id,
 		utils.WithOwner("someone-else"),
@@ -119,9 +156,28 @@ func TestZoneMutex(t *testing.T) {
 		t.Fatalf("別 owner のロックが %v、期待は utils.ErrStillLock", err)
 	}
 
-	// 同じ owner なら再取得できる（異常終了からの自己回復に必要）。
-	if err := mu.Lock(ctx); err != nil {
-		t.Fatalf("同一 owner でロックを再取得できない: %v", err)
+	// 同じ owner でも再入はできない（specs/006-zone-lock-redesign FR-017）。
+	if err := mu.Lock(ctx); !errors.Is(err, utils.ErrStillLock) {
+		t.Fatalf("同一 owner での再取得が %v、期待は utils.ErrStillLock", err)
+	}
+
+	// 保持期間の延長は Renew で行う（FR-022）。
+	before := soaLockDeadline(t, ctx, c, zone.Id)
+	if err := mu.Renew(ctx); err != nil {
+		t.Fatalf("ロックを延長できない: %v", err)
+	}
+	waitSOALabel(t, ctx, c, zone.Id, func(l map[string]string) bool {
+		d, err := strconv.ParseInt(l[utils.LockDeadlineLabelKey], 10, 64)
+		return err == nil && d > before
+	}, "ロック延長のラベル")
+	t.Logf("ロックを延長した: 奪ってよい時刻が %d より後になった", before)
+
+	// 保持者でない Mutex は延長・解放できない（FR-023・FR-024）。
+	if err := other.Renew(ctx); !errors.Is(err, utils.ErrNotLockHolder) {
+		t.Fatalf("保持者でない延長が %v、期待は utils.ErrNotLockHolder", err)
+	}
+	if err := other.Unlock(ctx); !errors.Is(err, utils.ErrNotLockHolder) {
+		t.Fatalf("保持者でない解放が %v、期待は utils.ErrNotLockHolder", err)
 	}
 
 	if err := mu.Unlock(ctx); err != nil {

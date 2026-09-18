@@ -10,6 +10,54 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **破壊的変更**: `utils.Mutex` のゾーン単位ロックを、同一のアクセストークンを用いる
+  複数のプログラム間でも排他が成立する方式へ改めた。仕様は
+  `specs/006-zone-lock-redesign` を参照
+  - `Lock` は再入できなくなった。保持中の再取得は `utils.ErrStillLock` を返す。
+    保持期間を延ばす場合は新設の `Renew` を使う
+  - 取得の判定は「奪ってよい時刻」のみで行う。owner が自分自身であることは取得の
+    条件ではなくなった。奪ってよい時刻が数値として解釈できない場合は、保持者不明として
+    取得を許す（以前は誰も取得できなくなった）
+  - 既定の owner の形式が「ホスト名の nodename」から「nodename-PID-ランダム値」へ変わり、
+    `NewMutex` の呼び出しごとに異なる値になった。`Owner` で取得できる
+  - `Unlock` と `Renew` は保持者の確認を伴う。保持者でない場合は他者の排他を変更せず
+    `utils.ErrNotLockHolder` を返す
+  - 取得の前後で、ゾーンに専用のレコード（既定 `_dpf-go-lock` の TXT）を一時的に
+    追加予定の状態で作る。排他が取得できた時点で取り消すため、権威サーバへは公開されない。
+    保持中に他者がゾーン反映した場合に公開されうるが、次の取得が削除予定にして
+    入れ直すことで自力で回復する
+  - 排他は SOA レコードのラベルを 2 つ使う。上限（10 個）を超える場合は
+    新設の `utils.ErrLabelLimit` を返し、書き込みを試みない
+- **破壊的変更**: `dpf.RecordsApi` に `PostRecord` / `DeleteRecord` /
+  `DeleteRecordChanges` を追加した。`client.RecordsAPI` を渡している場合は影響しない。
+  このインターフェースを自分で実装している場合は追随が必要
+
+### Added
+
+- `utils.Mutex.Renew`: 保持している排他の奪ってよい時刻を延長する
+- `utils.Mutex.Owner`: 排他の保持者を表す値を返す
+- `utils.ErrNotLockHolder` / `utils.ErrLabelLimit`
+- `utils.WithLockRecordTTL` / `utils.WithVerifyTimeout` /
+  `utils.WithLockRecordLabel` / `utils.WithLockRecordContent`
+- `utils.DefaultLockRecordTTL`（1 分）/ `utils.DefaultVerifyTimeout`（10 秒）/
+  `utils.DefaultLockRecordLabel`（`_dpf-go-lock`）
+
+### Fixed
+
+- 同一のアクセストークンを用いる複数のプログラムの間で、ゾーン単位ロックが排他として
+  成立していなかった。DPF-API は編集中のレコードへの他ユーザからの編集を拒否するが、
+  同一ユーザからの編集は拒否しないため、ラベルの読み取りから書き込みまでの間に競合すると
+  両方が取得に成功しうる状態だった
+- `Lock` が非同期のレコード更新の完了を待たずに復帰していた。書き込んだ内容が読み出せる
+  ことを確認してから復帰する
+- SOA レコードの行の選び方を、編集予定（state=3）を優先する形に改めた。編集予定の行と
+  反映済み（state=0）の行が同時に返る場合、反映済みを優先するとロックのラベルが付いて
+  いない行を読み、保持中の排他を他者へ渡しうる。現行の DPF-API は SOA を 1 行しか
+  返さないため実測では発生しないが、応答が変わった場合に備える。一意に決まらない場合は
+  エラーを返し、黙って選ばない
+
 ## [0.2.0] - 2026-09-18
 
 ### Added
