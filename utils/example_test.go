@@ -47,8 +47,8 @@ func ExampleGetRecordFromRecordName() {
 	fmt.Println(zone.Name, record.Name)
 }
 
-// ゾーン単位ロックをデフォルト設定（owner: ホスト名 / ttl: 15分）で取得し、
-// レコード編集後にロックを解放する。
+// ゾーン単位ロックをデフォルト設定（owner: インスタンスごとに一意 / ttl: 15分）で
+// 取得し、レコード編集後にロックを解放する。
 func ExampleNewMutex() {
 	cfg := dpf.NewConfiguration()
 	client := dpf.NewAPIClient(cfg)
@@ -66,6 +66,33 @@ func ExampleNewMutex() {
 	}()
 
 	// ここでロック対象ゾーンのレコードを編集し、ゾーン反映する。
+}
+
+// 編集が長引く場合に保持期間を延長する。
+//
+// ロックは再入できないため、Lock を呼び直して延長することはできない。
+// 延長は Renew で行う。
+func ExampleMutex_Renew() {
+	cfg := dpf.NewConfiguration()
+	client := dpf.NewAPIClient(cfg)
+	ctx := context.Background()
+
+	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+	if err := mu.Lock(ctx); err != nil {
+		return
+	}
+	defer func() {
+		if err := mu.Unlock(ctx); err != nil {
+			// ErrNotLockHolder の場合は保持中に奪われている。
+			fmt.Println(err)
+		}
+	}()
+
+	// 長い編集の途中で保持期間を延ばす。
+	if err := mu.Renew(ctx); err != nil {
+		// ErrNotLockHolder の場合は既に他者へ渡っているため、編集を中止する。
+		return
+	}
 }
 
 // owner と TTL を変更してロックを生成する。

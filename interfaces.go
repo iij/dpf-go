@@ -19,6 +19,9 @@ var _ ZonesApi = (*ZonesAPIService)(nil)
 type RecordsApi interface {
 	GetRecordList(ctx context.Context, zoneId string) ApiGetRecordListRequest
 	PatchRecord(ctx context.Context, zoneId string, recordId string) ApiPatchRecordRequest
+	PostRecord(ctx context.Context, zoneId string) ApiPostRecordRequest
+	DeleteRecord(ctx context.Context, zoneId string, recordId string) ApiDeleteRecordRequest
+	DeleteRecordChanges(ctx context.Context, zoneId string, recordId string) ApiDeleteRecordChangesRequest
 }
 
 var _ RecordsApi = (*RecordsAPIService)(nil)
