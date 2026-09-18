@@ -130,9 +130,29 @@ go test ./internal/integration/ -tags=integration -count=1 -parallel 1 -timeout 
 SC-001 が問うのは同時性である。`internal/integration` は API 呼び出しを直列化する制約
 （`-parallel 1`、同時実行数 1）を持つため、同時取得の確認はこの制約と両立しない。
 
-**判断**: 同時性の確認は `tasks.md` で手動手順として扱う。2 つのプロセスを同じトークンで
-同時に起動し、一方だけが取得することを確認する。自動化する場合は直列化の制約を回す必要が
-あるため、統合テスト本体には含めない。
+**判断**: 同時性の確認は手動手順として扱う。2 つのプロセスを同じトークンで同時に起動し、
+一方だけが取得することを確認する。自動化する場合は直列化の制約を回す必要があるため、
+統合テスト本体には含めない。確認用のコマンドは `internal/integration/manual` に置いた。
+
+```bash
+go build -o /tmp/dpflock ./internal/integration/manual
+AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%S.%NZ)
+/tmp/dpflock -at "$AT" & /tmp/dpflock -at "$AT" & wait
+```
+
+**実測（2026-09-18）**: 開始時刻を揃えた 2 プロセスを同一トークンで同時に起動し、
+取得に成功したのは 1 つだけであった。
+
+```text
+RESULT acquired=true  owner=...-1601400-8f94d60a elapsed=6.941s
+RESULT acquired=false owner=...-1601399-3dca85f8 elapsed=16.312s err=dpf: zone is still locked
+```
+
+敗者の 16.3 秒は、自分の追加予定が一覧へ現れるのを待って反映確認の上限（既定 10 秒）に
+達した経路と整合する。この経路では自分の専用レコードが追加予定のまま残りうるが、失効時刻
+（既定 1 分）の経過後に次の取得が取り消すため、手作業は要らない（FR-007・SC-006）。
+競合が実際に起きた場合の取得失敗はこの上限の分だけ遅くなる。短くしたい場合は
+`WithVerifyTimeout` で調整する。
 
 ## 5. 文書の確認 (FR-029〜FR-031)
 

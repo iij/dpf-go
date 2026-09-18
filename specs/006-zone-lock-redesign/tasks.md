@@ -171,7 +171,7 @@ description: "ゾーン単位の排他の見直しの実装タスク"
 - [X] T049 [P] `specs/003-utils-highlevel-api/spec.md` に、利用シナリオ 4 と FR-039〜FR-045・SC-013〜SC-015 が本仕様（006）に置き換えられた旨を追記し、双方から辿れるようにする（FR-031）
 - [X] T050 `make check` を実行し、マージ前の 7 ゲートすべてが成功することを確認する（[quickstart.md](./quickstart.md) 第 1 節）
 - [X] T051 `make test-integration` を実行し、`TestZoneMutex` と `TestLockRecordPremises` を含む全件が通ることを確認する。**トークン未設定でスキップされた結果を確認結果として報告しない**（憲章 品質ゲート、[quickstart.md](./quickstart.md) 第 4 節）
-- [ ] T052 同一トークンで 2 つのプロセスを同時に起動し、成立する排他が 1 つだけであることを手動で確認する。`internal/integration` は API 呼び出しを直列化するため自動化しない（SC-001、[quickstart.md](./quickstart.md) 第 4 節の判断）
+- [X] T052 同一トークンで 2 つのプロセスを同時に起動し、成立する排他が 1 つだけであることを手動で確認する。`internal/integration` は API 呼び出しを直列化するため自動化しない（SC-001、[quickstart.md](./quickstart.md) 第 4 節の判断）
 - [X] T053 [quickstart.md](./quickstart.md) 第 2〜5 節の確認表を上から順に実行し、各項目が満たされていることを確認する
 
 ---
@@ -271,14 +271,16 @@ US3（`Renew`）は US1 と独立であり、先に実装してもよい。US1 �
 
 ---
 
-## 未了のタスク (2026-09-18 時点)
+## 実行結果 (2026-09-18)
 
-実装は完了し、`make check`（マージ前 7 ゲート）と `make test-integration`（全 18 テスト、
-約 3 分 57 秒）がいずれも通っている。残る 1 件は手作業を要するため未了とする。
+**全 53 タスク完了。**
 
-| タスク | 必要なもの | 代替で得られている確証 |
-|---|---|---|
-| T052 | 同一トークンで 2 プロセスを同時に起動する手作業 | 事前判定・本判定・勝者判定の各分岐を単体テストで確認済み。`TestZoneMutex` で逐次の競合（別 owner が奪えない、同一 owner でも再入できない）を実 API で確認済み。確認できていないのは「同時に投げた場合」の 1 点のみ |
+| 確認 | 結果 |
+|---|---|
+| `make check`（マージ前 7 ゲート） | 通過 |
+| `make test-integration` | 全 18 テスト通過（約 3 分 57 秒） |
+| 単体テスト | 28 件通過（`go test ./utils/ -race`） |
+| 同時取得（T052、SC-001） | 2 プロセス同時起動で取得成功は 1 つだけ |
 
 ### T001 の実測結果
 
@@ -289,3 +291,20 @@ US3（`Renew`）は US1 と独立であり、先に実装してもよい。US1 �
 排他を他者へ渡す」事象は、現行の DPF-API では発生していなかった。state=3 を優先する実装は
 **既存の欠陥の修正ではなく、応答が変わった場合に備えた予防**である。この区別を
 `CHANGELOG.md`、research.md D10、`mutex_test.go` のコメントへ反映した。
+
+### T052 の実測結果
+
+開始時刻を揃えた 2 プロセスを同一のアクセストークンで同時に起動し、取得に成功したのは
+1 つだけであった。
+
+```text
+RESULT acquired=true  owner=...-1601400-8f94d60a elapsed=6.941s
+RESULT acquired=false owner=...-1601399-3dca85f8 elapsed=16.312s err=dpf: zone is still locked
+```
+
+敗者の 16.3 秒は、自分の追加予定が一覧へ現れるのを待って反映確認の上限（既定 10 秒）に
+達した経路と整合する（[research.md](./research.md) D7 の待機）。この経路では自分の専用
+レコードが追加予定のまま残りうるが、失効時刻の経過後に次の取得が取り消す。
+
+確認に用いたコマンドは `internal/integration/manual` に置いた。手順は
+[quickstart.md](./quickstart.md) 第 4 節と `internal/integration/README.md` を参照。
