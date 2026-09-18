@@ -69,6 +69,7 @@
 //   - misc/aws   : AWS Secrets Manager
 //   - misc/azure : Azure Key Vault
 //   - misc/gcp   : Google Secret Manager
+//   - misc/k8s   : Kubernetes Secret
 //
 // いずれも NewTokenProvider が返す関数をそのまま WithTokenProvider に渡せる。
 //

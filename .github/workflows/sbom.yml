@@ -3,7 +3,7 @@
 # リリース時に SBOM (sbom.spdx.json) を生成し、リリースページへ添付する。
 #
 # 本リポジトリは複数モジュール構成のため、リポジトリ全体を 1 度走査し、
-# root と misc/* の計 5 つの go.mod を単一の SPDX 文書にまとめる。
+# root と misc/* の計 6 つの go.mod を単一の SPDX 文書にまとめる。
 #
 # 生成は anchore/sbom-action (syft) に任せるが、リリースへの添付は gh で
 # 明示的に行う。action 自身のアップローダ (upload-release-assets) を

@@ -9,7 +9,7 @@
 [IIJ DNSプラットフォームサービス API (DPF-API)](https://manual.iij.jp/dpf/dpfapi/) の Go 言語クライアントライブラリです。
 
 > [!IMPORTANT]
-> 本ライブラリは IIJ DNS プラットフォームサービスのサポート対象外です。
+> 本プログラムは IIJ DNSプラットフォームサービスのサポート対象外です。
 > バグ報告や機能追加の要望は、サポートセンターではなく GitHub の Issue へお願いします。
 
 ## Requirements
@@ -34,6 +34,7 @@ go get github.com/iij/dpf-go/misc/vault   # HashiCorp Vault
 go get github.com/iij/dpf-go/misc/aws     # AWS Secrets Manager
 go get github.com/iij/dpf-go/misc/azure   # Azure Key Vault
 go get github.com/iij/dpf-go/misc/gcp     # Google Secret Manager
+go get github.com/iij/dpf-go/misc/k8s     # Kubernetes Secret
 ```
 
 ## クイックスタート
@@ -89,6 +90,7 @@ go run .
 | [`misc/aws`](https://pkg.go.dev/github.com/iij/dpf-go/misc/aws) | AWS Secrets Manager からトークンを取得 |
 | [`misc/azure`](https://pkg.go.dev/github.com/iij/dpf-go/misc/azure) | Azure Key Vault からトークンを取得 |
 | [`misc/gcp`](https://pkg.go.dev/github.com/iij/dpf-go/misc/gcp) | Google Secret Manager からトークンを取得 |
+| [`misc/k8s`](https://pkg.go.dev/github.com/iij/dpf-go/misc/k8s) | Kubernetes Secret からトークンを取得 |
 
 DPF-API 自体の仕様は [DPF-API リファレンスマニュアル](https://manual.iij.jp/dpf/dpfapi/) を参照してください。
 
@@ -183,7 +185,7 @@ make test-integration
 ## SBOM と provenance
 
 各リリースには SBOM (`sbom.spdx.json`, SPDX 2.3) がアセットとして添付されます。
-root と `misc/*` の計 5 モジュールの依存を単一の文書に含みます。
+root と `misc/*` の計 6 モジュールの依存を単一の文書に含みます。
 生成は [.github/workflows/sbom.yml](.github/workflows/sbom.yml) が
 [syft](https://github.com/anchore/syft) で行います。
 

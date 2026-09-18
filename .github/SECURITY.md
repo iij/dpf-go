@@ -11,7 +11,7 @@
 GitHub の **[Private vulnerability reporting](https://github.com/iij/dpf-go/security/advisories/new)** から報告してください。報告内容はメンテナと報告者だけが見られる非公開のドラフトアドバイザリとして扱われます。
 
 > [!IMPORTANT]
-> 本ライブラリは IIJ DNS プラットフォームサービスのサポート対象外ですが、
+> 本プログラムは IIJ DNSプラットフォームサービスのサポート対象外ですが、
 > **脆弱性の報告は受け付けます。**
 
 公開の Issue や Pull Request には書かないでください。修正版を用意する前に詳細が公開されると、利用者が攻撃にさらされます。

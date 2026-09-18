@@ -12,6 +12,20 @@
 
 ### Added
 
+- Kubernetes の Secret からトークンを取得する `misc/k8s` モジュール。
+  `NewTokenProviderFromEnvironment` は引数なしで使え、クラスタ内で動かす場合は
+  資格情報に紐づく名前空間の Secret `dpf-token` の `data.token` を読む。
+  名前空間・Secret 名・キー名は `WithNamespace` / `WithSecretName` / `WithKey` で
+  変更できる。接続情報を自分で用意する場合は `NewTokenProvider` に `SecretsAPI` を渡す
+  - 接続情報は Kubernetes の標準的なクライアントと同じ順序で選ぶ。環境変数
+    `KUBECONFIG` が指す設定ファイル（未設定なら `~/.kube/config`）を先に見て、
+    そこから接続情報が得られない場合にクラスタ内で割り当てられた資格情報を使う。
+    どちらからも得られない場合は `ErrNoCredentials` を返す
+  - 名前空間は選ばれた認証情報が持つ値のみを用い、決まらない場合は
+    `ErrNamespaceUnknown` を返す。`default` を補わず、別の認証情報の名前空間へ
+    回り込むこともしない。この点は client-go の挙動と異なる
+  - 他のシークレット管理サービス連携と同様、本体（`github.com/iij/dpf-go`）の
+    依存は増えない。`k8s.io/client-go` は `misc/k8s` にのみ現れる
 - `misc/vault`、`misc/aws`、`misc/azure`、`misc/gcp` の各モジュールに `LICENSE` を追加。
   Go モジュールの配布単位はモジュールのディレクトリ配下であるため、これらを独立に
   取得した利用者にはリポジトリルートの `LICENSE` が届かなかった
