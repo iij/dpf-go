@@ -10,6 +10,18 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
+### Added
+
+- `utils.Mutex.Renew`: 保持している排他の奪ってよい時刻を延長する
+- `utils.Mutex.Owner`: 排他の保持者を表す値を返す
+- `utils.ErrNotLockHolder` / `utils.ErrLabelLimit`
+- `utils.WithLockRecordTTL` / `utils.WithVerifyTimeout` /
+  `utils.WithLockRecordLabel` / `utils.WithLockRecordContent`
+- `utils.DefaultLockRecordTTL`（1 分）/ `utils.DefaultVerifyTimeout`（10 秒）/
+  `utils.DefaultLockRecordLabel`（`_dpf-go-lock`）
+
 ### Changed
 
 - **破壊的変更**: `utils.Mutex` のゾーン単位ロックを、同一のアクセストークンを用いる
@@ -33,16 +45,6 @@
 - **破壊的変更**: `dpf.RecordsApi` に `PostRecord` / `DeleteRecord` /
   `DeleteRecordChanges` を追加した。`client.RecordsAPI` を渡している場合は影響しない。
   このインターフェースを自分で実装している場合は追随が必要
-
-### Added
-
-- `utils.Mutex.Renew`: 保持している排他の奪ってよい時刻を延長する
-- `utils.Mutex.Owner`: 排他の保持者を表す値を返す
-- `utils.ErrNotLockHolder` / `utils.ErrLabelLimit`
-- `utils.WithLockRecordTTL` / `utils.WithVerifyTimeout` /
-  `utils.WithLockRecordLabel` / `utils.WithLockRecordContent`
-- `utils.DefaultLockRecordTTL`（1 分）/ `utils.DefaultVerifyTimeout`（10 秒）/
-  `utils.DefaultLockRecordLabel`（`_dpf-go-lock`）
 
 ### Fixed
 
@@ -158,6 +160,7 @@
 - Apache License 2.0 のもとで公開。全ファイルに SPDX ライセンス識別子を付与
 - セキュリティポリシー（[`.github/SECURITY.md`](.github/SECURITY.md)）
 
-[Unreleased]: https://github.com/iij/dpf-go/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/iij/dpf-go/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/iij/dpf-go/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iij/dpf-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iij/dpf-go/releases/tag/v0.1.0
