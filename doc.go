@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package dpf は IIJ DNS プラットフォームサービス（DPF）が提供する
+// Package dpf は IIJ DNSプラットフォームサービス（DPF）が提供する
 // DPF-API の Go クライアントである。
 //
 // 本パッケージの api_*.go / model_*.go / client.go / configuration.go /
@@ -100,5 +100,5 @@
 //   - github.com/iij/dpf-go/misc/... : シークレット管理サービスから
 //     トークンを取得する TokenProvider。他パッケージへの依存を本体に
 //     持ち込まないよう、独立したモジュールとして提供する
-//     （misc/vault、misc/aws、misc/azure、misc/gcp）。
+//     （misc/vault、misc/aws、misc/azure、misc/gcp、misc/k8s）。
 package dpf

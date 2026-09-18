@@ -44,3 +44,10 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Kubernetes の接続情報・資格情報（misc/k8s の手動確認で手元に置くことがある）
+kubeconfig
+kubeconfig.*
+.kube/
+*.key
+*.crt
