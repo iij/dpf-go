@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-18
+
 ### Added
 
 - Kubernetes の Secret からトークンを取得する `misc/k8s` モジュール。
@@ -40,15 +42,16 @@
   ソース提供義務を伴うライセンス（MPL-2.0）が本体モジュールに現れた場合は失敗する
 - 到達可能な既知脆弱性を検査する `make check-vuln`
 - リリース公開時に SBOM (`sbom.spdx.json`, SPDX 2.3) を生成し、リリースアセットとして添付する。
-  root と `misc/*` の計 5 モジュールの依存を単一の文書に含む
+  root と `misc/*` の計 6 モジュールの依存を単一の文書に含む
 - SBOM に対する SLSA provenance attestation。生成元のワークフローとタグを
   `gh attestation verify` で検証できる（public リポジトリでのみ有効）
 
 ### Changed
 
-- 全 6 モジュールの依存を最新版へ更新した。`misc/gcp` の
-  `google.golang.org/grpc` は v1.82.1 から v1.84.0 になり、これにより
-  到達可能な既知脆弱性 GO-2026-6348 が解消した
+- リポジトリ内の全 6 モジュールの依存を最新版へ更新。主なものは
+  `miekg/dns` v1.1.73、OpenTelemetry v1.46.0、`aws-sdk-go-v2` v1.47.0、
+  `azcore` v1.23.1、`google.golang.org/api` v0.298.0、`go-jose/v4` v4.1.5。
+  `k8s.io/client-go` は最新の安定版である v0.37.0 を維持している
 - `make lint` を `make check-lint` に改名。設定を `.golangci.yml` に固定し、
   整形の検査も同ターゲットが担うようにした。検査は作業ツリーを書き換えない
   （書き換えるのは `make fmt`）
@@ -67,8 +70,9 @@
 ### Fixed
 
 - `internal/integration` の 8 ファイルに欠けていた `// SPDX-License-Identifier: Apache-2.0` を付与
-- `misc/gcp` の `google.golang.org/grpc` を v1.82.0 から v1.82.1 へ更新（GO-2026-6061）
-- `misc/vault` の `github.com/go-jose/go-jose/v4` を v4.1.1 から v4.1.4 へ更新（GO-2026-4945）
+- `misc/gcp` の `google.golang.org/grpc` を v1.82.0 から v1.84.0 へ更新
+  （GO-2026-6061、GO-2026-6348）
+- `misc/vault` の `github.com/go-jose/go-jose/v4` を v4.1.1 から v4.1.5 へ更新（GO-2026-4945）
 
 ## [0.1.0] - 2026-08-28
 
@@ -106,5 +110,6 @@
 - Apache License 2.0 のもとで公開。全ファイルに SPDX ライセンス識別子を付与
 - セキュリティポリシー（[`.github/SECURITY.md`](.github/SECURITY.md)）
 
-[Unreleased]: https://github.com/iij/dpf-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/iij/dpf-go/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/iij/dpf-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iij/dpf-go/releases/tag/v0.1.0
