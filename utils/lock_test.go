@@ -34,6 +34,12 @@ type testRecord struct {
 	rrtype string
 	labels map[string]string
 	state  int // 0=反映済み 1=追加予定 2=削除予定 3=更新予定
+
+	// applied は反映済みの内容の控え。編集予定(state=3)になった時点で、
+	// その直前のラベルを保存する。公開されているレコードの一覧
+	// （GET /records/currents）は、編集予定のレコードについてこの控えを
+	// 「更新前の状態」(state=5) として返す。
+	applied map[string]string
 }
 
 // lockServer はレコードの取得・追加・更新・削除・取消を模擬するテストサーバ。
@@ -52,6 +58,16 @@ type lockServer struct {
 	posts   int
 	patches int
 	applies int // ゾーン反映の呼び出し回数。排他の操作では 0 でなければならない
+	atomics int // 一括置き換えの呼び出し回数
+	renews  int // 延長のための PATCH の回数（ラベルの deadline のみが変わった PATCH）
+
+	// allowApply が false の場合、ゾーン反映と一括置き換えの呼び出しはテストの
+	// 失敗として扱う。排他の操作（Lock / Renew / Unlock）はゾーン反映を伴っては
+	// ならないためである。一括置き換えを検証するテストだけが true にする。
+	allowApply bool
+
+	// atomicBody は直近の一括置き換えのリクエスト。フラグの確認に使う。
+	atomicBody *atomicRequest
 
 	// patched は直近に PATCH されたラベル（未 PATCH なら nil）
 	patched map[string]string
@@ -62,6 +78,121 @@ type lockServer struct {
 	cancelErr [2]string
 	// deleteErr は DeleteRecord を指定の error_details で失敗させる
 	deleteErr [2]string
+	// currentsErr は公開されているレコードの取得を失敗させる
+	currentsErr bool
+	// atomicErr は一括置き換えを指定の error_details で失敗させる
+	atomicErr [2]string
+	// jobFailed は JOB の状態を FAILED で返させる
+	jobFailed bool
+
+	// patchHook は PATCH の直前に呼ばれる。延長中の横取りの再現に使う。
+	patchHook func(s *lockServer, recordID string, labels map[string]string)
+
+	// patchFailN が正の場合、その回数だけ PATCH を 500 で失敗させる。
+	// 延長の一時的な失敗の再現に使う。
+	patchFailN int
+}
+
+// atomicRequest は一括置き換えのリクエスト。
+type atomicRequest struct {
+	Records []struct {
+		Name        string            `json:"name"`
+		Ttl         *int32            `json:"ttl"`
+		Rrtype      string            `json:"rrtype"`
+		Rdata       []any             `json:"rdata"`
+		Description string            `json:"description"`
+		Labels      map[string]string `json:"labels"`
+	} `json:"records"`
+	Description         *string `json:"description"`
+	OverwriteSoa        *bool   `json:"overwrite_soa"`
+	OverwriteZoneApexNs *bool   `json:"overwrite_zone_apex_ns"`
+}
+
+// isApexNS は Zone Apex の NS レコードかを返す。
+func (s *lockServer) isApexNS(name, rrtype string) bool {
+	return rrtype == "NS" && name == testZoneName
+}
+
+// currentsJSON は公開されているレコードの一覧を返す。
+//
+// 追加予定(state=1)は含めない。編集予定(state=3)は「更新前の状態」(state=5) として
+// 反映済みの内容の控えを返す。実 API の挙動に合わせている
+// （specs/007-zone-atomic-apply/research.md D1）。
+func (s *lockServer) currentsJSON() string {
+	results := make([]any, 0, len(s.records))
+	for _, r := range s.records {
+		switch r.state {
+		case 1:
+			continue
+		case 3:
+			snapshot := &testRecord{
+				id: r.id, name: r.name, rrtype: r.rrtype,
+				labels: r.applied, state: 5,
+			}
+			results = append(results, s.recordJSON(snapshot))
+		default:
+			results = append(results, s.recordJSON(r))
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"request_id": "req00000000001", "results": results})
+	return string(b)
+}
+
+// applyAtomic は一括置き換えを適用する。
+//
+// 実 API の挙動を再現する。すなわち、(1) 未反映の編集を破棄し、(2) リクエストの
+// レコードでゾーンを置き換える。ただし取り込まないフラグが立っている SOA と
+// Zone Apex の NS は、既存の反映済みのものを維持する
+// （specs/007-zone-atomic-apply/research.md D1・D1b）。
+func (s *lockServer) applyAtomic(req *atomicRequest) {
+	overwriteSoa := req.OverwriteSoa == nil || *req.OverwriteSoa
+	overwriteNS := req.OverwriteZoneApexNs == nil || *req.OverwriteZoneApexNs
+
+	// (1) 未反映の編集を破棄する。編集予定は反映済みの控えへ戻し、追加予定は消える。
+	kept := make([]*testRecord, 0, len(s.records))
+	for _, r := range s.records {
+		switch r.state {
+		case 1:
+			continue
+		case 3:
+			r.labels = r.applied
+			r.state = 0
+		case 2:
+			r.state = 0
+		}
+		kept = append(kept, r)
+	}
+
+	// (2) リクエストのレコードで置き換える。取り込まないフラグの対象は除く。
+	next := make([]*testRecord, 0, len(req.Records))
+	for _, rr := range req.Records {
+		if !overwriteSoa && rr.Rrtype == "SOA" {
+			continue
+		}
+		if !overwriteNS && s.isApexNS(rr.Name, rr.Rrtype) {
+			continue
+		}
+		rec := &testRecord{name: rr.Name, rrtype: rr.Rrtype, labels: rr.Labels, state: 0}
+		for _, old := range kept {
+			if old.name == rr.Name && old.rrtype == rr.Rrtype {
+				rec.id = old.id
+				break
+			}
+		}
+		if rec.id == "" {
+			s.nextID++
+			rec.id = fmt.Sprintf("atomicrec%04d", s.nextID)
+		}
+		next = append(next, rec)
+	}
+
+	// 取り込まなかった SOA と Zone Apex の NS は、既存の反映済みのものを維持する。
+	for _, old := range kept {
+		if (!overwriteSoa && old.rrtype == "SOA") || (!overwriteNS && s.isApexNS(old.name, old.rrtype)) {
+			next = append(next, old)
+		}
+	}
+	s.records = next
 }
 
 // newLockServer は SOA レコード 1 件だけを持つ模擬サーバを返す。
@@ -71,11 +202,12 @@ func newLockServer(labels map[string]string, state int) *lockServer {
 	}
 	return &lockServer{
 		records: []*testRecord{{
-			id:     testSOAID,
-			name:   testZoneName,
-			rrtype: "SOA",
-			labels: labels,
-			state:  state,
+			id:      testSOAID,
+			name:    testZoneName,
+			rrtype:  "SOA",
+			labels:  labels,
+			applied: labels,
+			state:   state,
 		}},
 	}
 }
@@ -88,6 +220,9 @@ func (s *lockServer) addRecord(r *testRecord) *testRecord {
 	}
 	if r.labels == nil {
 		r.labels = map[string]string{}
+	}
+	if r.applied == nil {
+		r.applied = r.labels
 	}
 	s.records = append(s.records, r)
 	return r
@@ -152,9 +287,13 @@ func writeParameterError(w http.ResponseWriter, code, attribute string) {
 	_, _ = w.Write(b)
 }
 
+// testRequestID は非同期レスポンスの request_id。生成コードは 32 文字以上を要求する。
+const testRequestID = "req00000000000000000000000000001"
+
 func writeAccepted(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusAccepted)
-	_, _ = w.Write([]byte(`{"request_id":"req00000000001","jobs_url":"http://x/jobs/req00000000001"}`))
+	_, _ = w.Write([]byte(`{"request_id":"` + testRequestID +
+		`","jobs_url":"http://x/jobs/` + testRequestID + `"}`))
 }
 
 // newLockClient は模擬サーバへ向けた API クライアントを返す。
@@ -165,8 +304,24 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 		defer s.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 
-		// パスは /zones/{zoneID}/... の形で届く。
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+
+		// JOB の状態取得。SyncWaitContext は jobs_url ではなく
+		// GET /jobs/{request_id} を叩く。
+		if len(parts) == 2 && parts[0] == "jobs" && r.Method == http.MethodGet {
+			status := "SUCCESSFUL"
+			body := map[string]any{"request_id": parts[1], "status": status,
+				"resources_url": "http://x/resources"}
+			if s.jobFailed {
+				body = map[string]any{"request_id": parts[1], "status": "FAILED",
+					"error_type": "SystemError", "error_message": "job failed"}
+			}
+			b, _ := json.Marshal(body)
+			_, _ = w.Write(b)
+			return
+		}
+
+		// 残りは /zones/{zoneID}/... の形で届く。
 		if len(parts) < 2 || parts[0] != "zones" || parts[1] != testZoneID {
 			http.NotFound(w, r)
 			return
@@ -174,11 +329,45 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 		rest := parts[2:]
 
 		switch {
-		// ゾーン反映。排他の操作では呼ばれてはならない（FR-026・SC-004）。
-		case len(rest) == 1 && (rest[0] == "changes" || rest[0] == "atomic_changes"):
+		// ゾーン反映。排他の操作では呼ばれてはならない（006 FR-026・SC-004）。
+		case len(rest) == 1 && rest[0] == "changes":
 			s.applies++
-			t.Errorf("排他の操作でゾーン反映 (%s) が呼ばれた", rest[0])
+			if !s.allowApply {
+				t.Errorf("排他の操作でゾーン反映 (changes) が呼ばれた")
+			}
 			writeAccepted(w)
+
+		// 一括置き換えと反映。
+		case len(rest) == 1 && rest[0] == "atomic_changes" && r.Method == http.MethodPatch:
+			s.atomics++
+			if !s.allowApply {
+				t.Errorf("排他の操作で一括置き換え (atomic_changes) が呼ばれた")
+			}
+			if s.atomicErr[0] != "" {
+				writeParameterError(w, s.atomicErr[0], s.atomicErr[1])
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			var req atomicRequest
+			if err := json.Unmarshal(body, &req); err != nil {
+				t.Errorf("unmarshal atomic_changes body: %v", err)
+			}
+			s.atomicBody = &req
+			if !s.jobFailed {
+				// JOB が失敗する場合は適用しない。一括置き換えはアトミックであり、
+				// 失敗した反映が中途半端に適用されることはない。
+				s.applyAtomic(&req)
+			}
+			writeAccepted(w)
+
+		// 公開されているレコードの一覧。
+		case len(rest) == 2 && rest[0] == "records" && rest[1] == "currents" && r.Method == http.MethodGet:
+			if s.currentsErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"request_id":"x","error_type":"SystemError","error_message":"e"}`))
+				return
+			}
+			_, _ = w.Write([]byte(s.currentsJSON()))
 
 		case len(rest) == 1 && rest[0] == "records" && r.Method == http.MethodGet:
 			if s.getErr {
@@ -214,6 +403,12 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 
 		case len(rest) == 2 && rest[0] == "records" && r.Method == http.MethodPatch:
 			s.patches++
+			if s.patchFailN > 0 {
+				s.patchFailN--
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"request_id":"x","error_type":"SystemError","error_message":"e"}`))
+				return
+			}
 			rec := s.find(rest[1])
 			if rec == nil {
 				writeParameterError(w, "not_found", "record")
@@ -226,11 +421,21 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 			if err := json.Unmarshal(body, &pr); err != nil {
 				t.Errorf("unmarshal patch body: %v", err)
 			}
+			if s.patchHook != nil {
+				s.patchHook(s, rec.id, pr.Labels)
+			}
+			// owner が変わらず deadline だけが変わった PATCH を延長として数える。
+			if rec.labels[LockOwnerLabelKey] == pr.Labels[LockOwnerLabelKey] &&
+				rec.labels[LockDeadlineLabelKey] != pr.Labels[LockDeadlineLabelKey] {
+				s.renews++
+			}
 			s.patched = pr.Labels
-			rec.labels = pr.Labels
 			if rec.state == 0 {
+				// 反映済みから編集予定へ移る時点の内容を控える。
+				rec.applied = rec.labels
 				rec.state = 3
 			}
+			rec.labels = pr.Labels
 			writeAccepted(w)
 
 		case len(rest) == 2 && rest[0] == "records" && r.Method == http.MethodDelete:
@@ -305,6 +510,9 @@ func testMutex(c *dpf.APIClient, owner string, now time.Time, opts ...Option) *M
 }
 
 func fixedNow() time.Time { return time.Unix(1_700_000_000, 0) }
+
+// timeString は Unixtime の 10 進表記を返す。ラベルの比較に使う。
+func timeString(t time.Time) string { return strconv.FormatInt(t.Unix(), 10) }
 
 // ---- 土台 (T017) ----
 
@@ -921,5 +1129,339 @@ func TestMutexLock_CustomLockRecord(t *testing.T) {
 	// 専用レコードの名前はゾーン名と結合される。
 	if got := m.lockRecordName(&dpf.Record{Name: testZoneName}); got != "_mylock."+testZoneName {
 		t.Errorf("専用レコード名: got %q", got)
+	}
+}
+
+// ---- 土台: Do (T011) ----
+
+func TestMutexDo_RunsUnderLock(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	var ownerDuringFn string
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		s.mu.Lock()
+		ownerDuringFn = s.find(testSOAID).labels[LockOwnerLabelKey]
+		s.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ownerDuringFn != "alice" {
+		t.Errorf("処理の実行中に排他が保持されていない: owner=%q", ownerDuringFn)
+	}
+	// 終了時に解放される（奪ってよい時刻が現在時刻になる）。
+	want := strconv.FormatInt(now.Unix(), 10)
+	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+		t.Errorf("解放されていない: deadline=%q, want %q", got, want)
+	}
+	if s.applies != 0 || s.atomics != 0 {
+		t.Errorf("ゾーン反映が呼ばれた: changes=%d atomic=%d", s.applies, s.atomics)
+	}
+}
+
+func TestMutexDo_ContextIsDerived(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	type key struct{}
+	parent := context.WithValue(context.Background(), key{}, "v")
+	var got any
+	if err := m.Do(parent, func(ctx context.Context) error {
+		got = ctx.Value(key{})
+		return nil
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "v" {
+		t.Errorf("処理へ渡る context が呼び出し側から派生していない: %v", got)
+	}
+}
+
+func TestMutexDo_NotCalledWhenLocked(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	called := false
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrStillLock) {
+		t.Fatalf("ErrStillLock を期待したが %v", err)
+	}
+	if called {
+		t.Error("排他を取得できていないのに処理が実行された")
+	}
+}
+
+func TestMutexDo_ReturnsFnError(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	sentinel := errors.New("処理のエラー")
+	err := m.Do(context.Background(), func(ctx context.Context) error { return sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("処理のエラーがそのまま返らない: %v", err)
+	}
+	// 失敗しても解放される。
+	want := strconv.FormatInt(now.Unix(), 10)
+	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+		t.Errorf("失敗時に解放されていない: deadline=%q", got)
+	}
+}
+
+// ---- 利用シナリオ 1: 自動延長と打ち切り (T012〜T018) ----
+
+// doMutex は延長の検証向けに、間隔を短くした Mutex を返す。
+func doMutex(c *dpf.APIClient, owner string, now time.Time, opts ...Option) *Mutex {
+	opts = append([]Option{WithRenewInterval(10 * time.Millisecond)}, opts...)
+	return testMutex(c, owner, now, opts...)
+}
+
+// patchCount は模擬サーバの PATCH 回数を返す。
+func patchCount(s *lockServer) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.patches
+}
+
+// waitPatchAbove は PATCH 回数が n を超えるまで待つ。超えなければ false。
+func waitPatchAbove(s *lockServer, n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if patchCount(s) > n {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+func TestMutexDo_RenewsWhileRunning(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now)
+
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		after := patchCount(s) // 取得の書き込みまでを含む
+		if !waitPatchAbove(s, after, 2*time.Second) {
+			t.Error("処理の実行中に延長が走っていない")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMutexDo_RenewIntervalDefault(t *testing.T) {
+	s := newLockServer(nil, 0)
+	c := newLockClient(t, s)
+
+	m := NewMutex(c.RecordsAPI, testZoneID)
+	if want := DefaultLockTTL / renewIntervalDivisor; m.renewInterval != want {
+		t.Errorf("既定の延長の間隔が %v（想定 %v）", m.renewInterval, want)
+	}
+
+	// 保持期間を変えると比が保たれる。
+	m2 := NewMutex(c.RecordsAPI, testZoneID, WithTTL(30*time.Minute))
+	if want := 30 * time.Minute / renewIntervalDivisor; m2.renewInterval != want {
+		t.Errorf("保持期間 30 分での延長の間隔が %v（想定 %v）", m2.renewInterval, want)
+	}
+
+	// 明示すればその値になる。順序にも依存しない。
+	m3 := NewMutex(c.RecordsAPI, testZoneID, WithRenewInterval(time.Second), WithTTL(time.Hour))
+	if m3.renewInterval != time.Second {
+		t.Errorf("WithRenewInterval が効いていない: %v", m3.renewInterval)
+	}
+
+	// 0 以下は無視される。
+	m4 := NewMutex(c.RecordsAPI, testZoneID, WithRenewInterval(0))
+	if want := DefaultLockTTL / renewIntervalDivisor; m4.renewInterval != want {
+		t.Errorf("0 が無視されていない: %v", m4.renewInterval)
+	}
+}
+
+func TestMutexDo_StolenCancelsFn(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now)
+
+	cancelled := false
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		// 他者が排他を奪った状況を作る。
+		s.mu.Lock()
+		s.find(testSOAID).labels = lockLabel("bob", now.Unix()+3600)
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			cancelled = true
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	})
+
+	if !cancelled {
+		t.Error("排他を奪われたのに処理の context が打ち切られていない")
+	}
+	if !errors.Is(err, ErrNotLockHolder) {
+		t.Fatalf("ErrNotLockHolder を期待したが %v", err)
+	}
+	// 解放の ErrNotLockHolder を重ねて報告しない。
+	if err.Error() != ErrNotLockHolder.Error() {
+		t.Errorf("エラーが重複している: %v", err)
+	}
+}
+
+func TestMutexDo_StolenJoinsFnError(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now)
+
+	sentinel := errors.New("処理のエラー")
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		s.mu.Lock()
+		s.find(testSOAID).labels = lockLabel("bob", now.Unix()+3600)
+		s.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(2 * time.Second):
+		}
+		return sentinel
+	})
+
+	if !errors.Is(err, ErrNotLockHolder) {
+		t.Errorf("ErrNotLockHolder に一致しない: %v", err)
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("処理のエラーに一致しない: %v", err)
+	}
+}
+
+func TestMutexDo_TransientRenewFailure(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now)
+
+	// 取得の書き込みの後、延長の 2 回を失敗させる。
+	err := m.Do(context.Background(), func(ctx context.Context) error {
+		s.mu.Lock()
+		s.patchFailN = 2
+		s.mu.Unlock()
+
+		// 失敗の後に成功する延長を待つ。
+		after := patchCount(s)
+		if !waitPatchAbove(s, after+2, 2*time.Second) {
+			t.Error("一時的な失敗の後に延長が再試行されていない")
+		}
+		select {
+		case <-ctx.Done():
+			t.Error("一時的な失敗で処理が打ち切られた")
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("一時的な失敗で Do が失敗した: %v", err)
+	}
+}
+
+func TestMutexDo_RenewLoopStopped(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now)
+
+	// doHold を直接呼び、保持の状態を取り出す。Do が復帰した時点で延長の
+	// goroutine が終了していることを、done が閉じていることで確かめる。
+	var h *hold
+	err := m.doHold(context.Background(), func(ctx context.Context, hh *hold) error {
+		h = hh
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-h.done:
+	default:
+		t.Error("復帰時に延長の goroutine が終了していない")
+	}
+
+	// 復帰後は延長の書き込みが起きない。
+	stable := patchCount(s)
+	time.Sleep(50 * time.Millisecond) // 延長の間隔 10ms の 5 倍
+	if got := patchCount(s); got != stable {
+		t.Errorf("復帰後に延長が走っている: PATCH が %d → %d", stable, got)
+	}
+}
+
+// ---- 利用シナリオ 3: 取得の待機 (T039〜T040) ----
+
+func TestMutexDo_LockWaitRetries(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now, WithLockWait(5*time.Millisecond))
+
+	// 少し経ってから他者の排他が期限切れになる状況を作る。
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		s.mu.Lock()
+		s.find(testSOAID).labels = lockLabel("bob", now.Unix()-1)
+		s.mu.Unlock()
+	}()
+
+	called := false
+	if err := m.Do(context.Background(), func(ctx context.Context) error {
+		called = true
+		return nil
+	}); err != nil {
+		t.Fatalf("待機の指定があれば取得できるまで繰り返すこと: %v", err)
+	}
+	if !called {
+		t.Error("処理が実行されていない")
+	}
+}
+
+func TestMutexDo_LockWaitHonorsCancel(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	c := newLockClient(t, s)
+	m := doMutex(c, "alice", now, WithLockWait(5*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+
+	called := false
+	err := m.Do(ctx, func(ctx context.Context) error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("context.DeadlineExceeded を期待したが %v", err)
+	}
+	if called {
+		t.Error("取得できていないのに処理が実行された")
+	}
+	if s.patches != 0 {
+		t.Errorf("待機中に書き込みが発生した（PATCH %d 回）", s.patches)
 	}
 }

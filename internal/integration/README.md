@@ -115,11 +115,14 @@ AT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%S.%NZ)
 
 ## 所要時間
 
-実測で全 18 テストが約 3 分 57 秒（2026-09-18）。内訳の大きいものは
-`TestLockRecordPremises` が 66 秒（ゾーン反映 2 回を含む）、`TestZoneMutex` が 58 秒、
-`TestRecordLifecycle` が 57 秒である。`TestZoneMutex` は
-`specs/006-zone-lock-redesign` の実装により、排他の取得 1 回あたりの API 呼び出しが
-増えたため以前より長い。ゾーン反映が権威サーバへ行き渡るのは速く、
+実測で全 22 テストが約 10 分 44 秒（2026-09-24）。内訳の大きいものは
+`TestZoneMutexDoRenews` が 106 秒、`TestLockFlow_ZoneChanges` が 84 秒、
+`TestZoneMutexDoPerRecord` が 74 秒、`TestLockFlow_AtomicChangesLosesLock` が 75 秒、
+`TestZoneApplierApply` が 71 秒、`TestLockRecordPremises` が 66 秒である。
+
+排他に関するテストが長いのは、ゾーン反映を伴うためである。`TestZoneMutexDoRenews` は
+保持期間（1 分）より長く待って自動延長が効いていることを確認するため、原理的に
+1 分以上かかる。`specs/007-zone-atomic-apply/quickstart.md` 第 4 節の判断を参照。ゾーン反映が権威サーバへ行き渡るのは速く、
 レコード追加は 17ms、削除は 12 秒で確認できた（いずれも上限 10 分に対して）。
 
 `DPF_TEST_DNS_TIMEOUT` の既定 10 分は「異常を検出するための天井」であり、

@@ -66,6 +66,8 @@ const (
 	maxRecordLabels = 10
 	// maxLabelValueLen はラベル値の最大長（DPF-API の仕様）。
 	maxLabelValueLen = 63
+	// renewIntervalDivisor は延長の間隔を保持期間から導く除数。
+	renewIntervalDivisor = 3
 	// defaultPollInterval は非同期処理の反映を待つ際のポーリング間隔。
 	defaultPollInterval = 500 * time.Millisecond
 )
@@ -136,6 +138,35 @@ func newOwner() string {
 // Lock した SOA ごとゾーン反映することを想定している。反映後に Unlock すると
 // レコードは編集可能な状態に戻り、再 Lock できる。
 //
+// 反映の方法によって注意点が異なる。
+//
+// PatchZoneChanges（編集中レコードのゾーン反映）は未反映の編集をすべて反映するため、
+// SOA に書いたロックの情報も一緒に反映される。ラベルは反映後も残るため、続けて
+// Unlock で解放できる。これが想定している使い方である。
+//
+// PatchZoneAtomicChanges（レコードの一括更新とゾーン反映）は、**ロックを保持したまま
+// 使えない。** ロックのラベルは SOA の「未反映の編集」としてのみ存在し、一括更新は未反映の
+// 編集を引き継がないためである。overwrite_soa の値は関係しない。この項目は「リクエストに
+// 入れた SOA を取り込むか」を決めるだけで、未反映の編集を復活させるものではない。
+//
+// GetRecordCurrents は反映済みの姿を返すため、そこから組み立てたリクエストにロックの
+// ラベルは含まれない。編集予定の SOA は「更新前の状態」(state=5) として返る。
+// GetRecordList が編集予定 (state=3) の行を返すのとは見え方が異なる。
+//
+// 反映の完了後は他者が排他を取得できる状態になり、Unlock は ErrNotLockHolder を返す。
+// **ゾーン全体を一括で置き換える場合は ZoneApplier を使うこと。** 取り込みの可否を決める
+// フラグを固定し、反映の前に自動延長を止め、反映の後は排他が残っていた場合に限り解放
+// するところまでを引き受ける。
+//
+// レコードを 1 つずつ変更してゾーンへ反映する流れでは、この制約は無い。反映によって
+// 排他は解かれず、ラベルは反映後も残る。Mutex.Do の中で反映まで行えばよい。
+//
+// ただしこの流れには注意がある。**ゾーン反映によってロックのラベルは「反映済み」に
+// なる。その後の Unlock は未反映の編集を作るため、これを破棄すると、反映済みの側に
+// 残った排他（奪ってよい時刻が未来）が復活する。** ゾーンの未反映の編集を一括で破棄する
+// 操作（DeleteZoneChanges など）を解放の後に行うと、保持期間が過ぎるまでゾーンが
+// ロックされたままになる。解放は破棄ではなく反映によって確定させること。
+//
 // 排他は SOA レコードのラベルを 2 つ使う。1 レコードのラベル数の上限は 10 であるため、
 // 利用者が SOA レコードへ自由に付けられるラベルは 8 個までである。上限を超える場合、
 // Lock は書き込みを試みずに ErrLabelLimit を返す。
@@ -156,6 +187,8 @@ type Mutex struct {
 	lockRecordLabel  string
 	lockRecordRrtype dpf.RecordsRrtypeWithoutSoa
 	lockRecordRdata  []string
+	renewInterval    time.Duration
+	lockWait         time.Duration
 
 	// zoneName は SOA レコードから導いたゾーン名。2 回目以降は問い合わせを省く。
 	zoneName string
@@ -247,6 +280,34 @@ func WithLockRecordContent(rrtype dpf.RecordsRrtypeWithoutSoa, rdata []string) O
 	}
 }
 
+// WithRenewInterval は Do の実行中に保持期間を延長する間隔を指定する
+// （デフォルト: 保持期間の 1/3。既定の保持期間 15 分では 5 分）。
+// 0 以下を渡した場合はデフォルトのままとする。
+//
+// 保持期間より十分短くすること。延長が一時的に失敗しても次の周期で間に合う
+// ようにするためである。
+func WithRenewInterval(d time.Duration) Option {
+	return func(m *Mutex) {
+		if d > 0 {
+			m.renewInterval = d
+		}
+	}
+}
+
+// WithLockWait は Do が排他を取得できるまで待つ間隔を指定する
+// （デフォルト: 待たない）。0 以下を渡した場合は待たない。
+//
+// 指定しない場合、Do は排他を取得できなければただちに ErrStillLock を返す。
+// 指定した場合は、取得できるまでこの間隔で繰り返す。待機は呼び出し側の
+// 打ち切りに従う。
+func WithLockWait(d time.Duration) Option {
+	return func(m *Mutex) {
+		if d > 0 {
+			m.lockWait = d
+		}
+	}
+}
+
 // NewMutex はゾーン zoneID に対するロックを生成する。
 //   - cr     : レコード API（*dpf.RecordsAPIService が利用できる）
 //   - zoneID : 対象ゾーンの ID
@@ -273,6 +334,11 @@ func NewMutex(cr dpf.RecordsApi, zoneID string, opts ...Option) *Mutex {
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+	if m.renewInterval <= 0 {
+		// 保持期間が切れるまでに 3 回の機会があるようにする。保持期間を変えた
+		// 利用者に対しても比が崩れないよう、固定値ではなく比で導く。
+		m.renewInterval = m.ttl / renewIntervalDivisor
 	}
 	return m
 }
@@ -548,6 +614,200 @@ func (t *Mutex) LockWait(ctx context.Context, interval time.Duration) error {
 		case <-time.After(interval):
 		}
 	}
+}
+
+// hold は Do が保持している排他を表す。Do の実行中にのみ存在する。
+//
+// 一括置き換えのように「反映そのものが排他を解く」操作のために consume を持つ。
+// これを公開すると、Do を使うすべての利用者が一括置き換えの都合を背負うことに
+// なるため、型ごと非公開にしている。
+type hold struct {
+	// cancel は利用者の処理へ渡した context を打ち切る。
+	cancel context.CancelFunc
+	// stop は延長の goroutine への停止の合図。
+	stop chan struct{}
+	// done は延長の goroutine が終了したことの通知。
+	done chan struct{}
+
+	stopOnce sync.Once
+
+	mu sync.Mutex
+	// consumed は、この先で排他が解かれることの印。
+	consumed bool
+	// lostErr は延長によって保持者でないと判明したときのエラー。
+	lostErr error
+}
+
+// consume は、この先の操作が排他を解くことを Do へ伝える。
+// 延長を止め、終了時の解放で ErrNotLockHolder を成功として扱うようにする。
+//
+// 一括置き換えを呼ぶ直前に呼ぶ。これより早いと編集中の延長が止まり、遅いと
+// 反映中に延長が走って、作り直される SOA を掴もうとする。
+func (h *hold) consume() {
+	h.mu.Lock()
+	h.consumed = true
+	h.mu.Unlock()
+	h.stopRenew()
+}
+
+// isConsumed は consume が呼ばれたかを返す。
+func (h *hold) isConsumed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.consumed
+}
+
+// lost は延長によって保持者でないと判明したことを記録する。
+func (h *hold) lost(err error) {
+	h.mu.Lock()
+	if h.lostErr == nil {
+		h.lostErr = err
+	}
+	h.mu.Unlock()
+}
+
+// lostError は記録されたエラーを返す。失われていない場合は nil。
+func (h *hold) lostError() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lostErr
+}
+
+// stopRenew は延長の goroutine を止め、終了を待つ。複数回呼んでもよい。
+func (h *hold) stopRenew() {
+	h.stopOnce.Do(func() { close(h.stop) })
+	<-h.done
+}
+
+// Do は排他を取得し、fn を実行し、終了時に解放する。
+//
+// fn へ渡される context は ctx から派生したものであり、**排他を他者に奪われた
+// 時点で打ち切られる。** 保護が切れたことを知らないまま処理が走り続ける状態を
+// 作らないためである。ただし打ち切りは通知であって強制的な中断ではない。
+// fn が context を無視すれば走り続け、Do はその終了を待つ。
+//
+// 実行中、保持期間は自動で延長される（既定では保持期間の 1/3 ごと。
+// WithRenewInterval で変更できる）。利用者が延長を書く必要はない。延長が
+// 「保持者でない」以外の理由で失敗した場合は、次の周期で再試行する。
+// **失敗が続く間は、排他が実際には失効しているのに fn が走りうる。** この窓の
+// 長さは延長の間隔に依存する。
+//
+// 排他を取得できない場合、fn は呼ばれず ErrStillLock を返す。取得できるまで
+// 待つ場合は WithLockWait を使う。
+//
+// 終了時は、自分が保持者である場合に限り解放する。fn が返したエラーは種類を
+// 判別できる形のまま返す。排他を失った場合は ErrNotLockHolder を返し、fn も
+// エラーを返していた場合は両方を判別できる形で返す。
+//
+// Do が復帰した時点で、延長のための goroutine は終了している。
+//
+// fn の異常終了（panic）は捕捉しない。この場合、解放は行われず、排他は保持期間の
+// 経過によって解ける。
+//
+// レコードを 1 つずつ変更してゾーンへ反映する流れは、この操作で足りる。その流れ
+// では反映によって排他が解かれないため、fn の中で反映まで行い、復帰後に解放される。
+// ゾーン全体を一括で置き換える場合は ZoneApplier を使うこと。一括置き換えは排他を
+// 解くため、この操作から直接呼ぶと終了時の解放が ErrNotLockHolder になる。
+func (t *Mutex) Do(ctx context.Context, fn func(ctx context.Context) error) error {
+	return t.doHold(ctx, func(ctx context.Context, _ *hold) error {
+		return fn(ctx)
+	})
+}
+
+// doHold は Do の実装。fn へ hold を渡すため非公開にしている。
+func (t *Mutex) doHold(ctx context.Context, fn func(context.Context, *hold) error) error {
+	if err := t.acquire(ctx); err != nil {
+		return err
+	}
+
+	hctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	h := &hold{
+		cancel: cancel,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+	go t.renewLoop(hctx, h)
+
+	fnErr := fn(hctx, h)
+	h.stopRenew()
+
+	lostErr := h.lostError()
+	relErr := t.release(ctx, h)
+
+	switch {
+	case lostErr != nil:
+		// 排他を失ったことが根本原因である。解放のエラー（保持者でない）は
+		// 同じことを言っているため重ねない。
+		if fnErr != nil {
+			return errors.Join(lostErr, fnErr)
+		}
+		return lostErr
+	case fnErr != nil:
+		return fnErr
+	default:
+		return relErr
+	}
+}
+
+// renewLoop は保持期間を周期的に延長する。Do の実行中のみ動く。
+//
+// 停止の合図または context の打ち切りを受けたら終了する。終了時に done を
+// 閉じるため、stopRenew はこれを待てる。
+func (t *Mutex) renewLoop(ctx context.Context, h *hold) {
+	defer close(h.done)
+
+	ticker := time.NewTicker(t.renewInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			err := t.Renew(ctx)
+			if err == nil {
+				continue
+			}
+			if errors.Is(err, ErrNotLockHolder) {
+				// 他者に奪われた。保護が切れたことを処理へ伝えて終了する。
+				h.lost(err)
+				h.cancel()
+				return
+			}
+			// それ以外（通信の失敗など）は次の周期で再試行する。一時的な失敗で
+			// 編集作業を落とさないためである。保持期間が切れれば他者に奪われ、
+			// 上の経路で中止される。
+		}
+	}
+}
+
+// acquire は排他を取得する。待機の指定があれば取得できるまで繰り返す。
+func (t *Mutex) acquire(ctx context.Context) error {
+	if t.lockWait > 0 {
+		return t.LockWait(ctx, t.lockWait)
+	}
+	return t.Lock(ctx)
+}
+
+// release は終了時の解放を行う。
+//
+// Unlock は保持者でない場合に ErrNotLockHolder を返すため、「自分が保持者である
+// 場合に限り解放する」はこれで満たされる。consume されている場合（一括置き換えに
+// よって排他が解かれた場合）は、残っていた場合に限り解放するという意味になるため、
+// ErrNotLockHolder を成功として扱う。
+func (t *Mutex) release(ctx context.Context, h *hold) error {
+	err := t.Unlock(ctx)
+	if err == nil {
+		return nil
+	}
+	if h.isConsumed() && errors.Is(err, ErrNotLockHolder) {
+		return nil
+	}
+	return err
 }
 
 // getSOA は排他の判定に用いる SOA レコードを返す。

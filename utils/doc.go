@@ -95,5 +95,29 @@
 // 時点で取り消され、権威サーバへは公開されない。
 //
 // ロックは再入できない。保持期間を延ばす場合は Renew を使う。取得・延長・解放は
-// いずれもゾーン反映を行わない。詳細は Mutex を参照。
+// いずれもゾーン反映を行わない。
+//
+// 取得と解放の対を自分で書く代わりに、Mutex.Do へ処理を渡せる。実行中は保持期間が
+// 自動で延長され、終了時に解放される。排他を他者に奪われた場合は、処理へ渡した
+// context が打ち切られる。
+//
+//	mu := utils.NewMutex(client.RecordsAPI, zoneID)
+//	err := mu.Do(ctx, func(ctx context.Context) error {
+//		// ここでレコードを編集し、ゾーンへ反映する。
+//		return nil
+//	})
+//
+// ゾーン全体を読んで編集し、一括で置き換える場合は ZoneApplier を使う。排他の取得と
+// 解放に加えて、取り込みの可否を決めるフラグの固定と、反映によって排他が解かれることの
+// 扱いを引き受ける。利用者が書くのは編集の内容だけである。
+//
+//	ap := utils.NewZoneApplier(client.RecordsAPI, client.ZonesAPI, client.JobsAPI, zoneID)
+//	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+//		// records を編集して返す。編集しない要素はそのまま返せばよい。
+//		return records, nil
+//	})
+//
+// レコードの一括更新とゾーン反映を行う PatchZoneAtomicChanges は、ロックを保持したまま
+// 使えない。ロックのラベルは SOA の「未反映の編集」としてのみ存在し、一括更新は未反映の
+// 編集を引き継がないためである。overwrite_soa の値は関係しない。詳細は Mutex を参照。
 package utils
