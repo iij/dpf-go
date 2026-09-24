@@ -10,6 +10,41 @@
 
 ## [Unreleased]
 
+### Added
+
+- `utils.Mutex.Do`: 排他を保持したまま処理を実行する。実行中は保持期間を自動で延長し、
+  終了時に解放する。排他を他者に奪われた場合は、処理へ渡した `context` を打ち切って
+  `utils.ErrNotLockHolder` を返す。取得と解放の対、および延長を利用者が書く必要がなくなる。
+  仕様は `specs/007-zone-atomic-apply` を参照
+  - 延長が「保持者でない」以外の理由で失敗した場合は次の周期で再試行する。**失敗が続く間は、
+    排他が実際には失効しているのに処理が走りうる。** この窓の長さは延長の間隔に依存する
+  - 処理の異常終了（panic）は捕捉しない。この場合、排他は保持期間の経過によって解ける
+  - `Do` が復帰した時点で、延長のための goroutine は終了している
+- `utils.ZoneApplier` / `utils.NewZoneApplier` / `ZoneApplier.Apply`: ゾーン全体を読んで
+  編集し、一括で置き換えて反映する。排他の下で行い、利用者が書くのは編集の内容だけである
+  - `overwrite_soa` と `overwrite_zone_apex_ns` は常に `false` で送る。**これらの既定値は
+    `true` であり、公開されているレコードから組み立てたリクエストをそのまま送ると SOA と
+    Zone Apex の NS が意図せず置き換わる。** 利用者が変更する手段は設けていない
+  - 一括置き換えは排他を解く（排他のラベルは SOA の「未反映の編集」としてのみ存在し、
+    一括置き換えは未反映の編集を引き継がないため）。このため反映の前に自動延長を止め、
+    反映の後は排他が残っていた場合に限り解放する。**成功した呼び出しが解放に起因して
+    失敗することはない**
+  - 編集関数の入力と出力は同じ型である。編集しない要素はそのまま返せばよく、ラベル・TTL・
+    コメントを写し忘れて失う心配がない
+- `utils.ZoneRecordsEditor` / `utils.ApplyOption` / `utils.ErrNoRecords`
+- `utils.WithRenewInterval`（延長の間隔。既定は保持期間の 1/3）/ `utils.WithLockWait`
+  （排他を取得できるまで待つ間隔。既定は待たない）/ `utils.WithApplyDescription`
+- `utils.Mutex.Owner` / `utils.ZoneApplier.Owner`: 排他の保持者を表す値を返す（診断用）
+
+### Changed
+
+- **破壊的変更**: `dpf.ZonesApi` に `PatchZoneAtomicChanges` を、`dpf.RecordsApi` に
+  `GetRecordCurrents` を追加した。`client.ZonesAPI` / `client.RecordsAPI` を渡している場合は
+  影響しない。これらのインターフェースを自分で実装している場合は追随が必要
+- `dpf.JobsApi` を新設した（`SyncWaitContext` のみ）。新規のため既存の利用者に影響しない
+- `utils.Mutex` の godoc に、ゾーン全体の一括置き換えを排他の保持中に使えないこと、および
+  その場合は `utils.ZoneApplier` を使うことを明記した
+
 ## [0.3.0] - 2026-09-18
 
 ### Added

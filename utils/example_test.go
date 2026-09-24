@@ -95,6 +95,62 @@ func ExampleMutex_Renew() {
 	}
 }
 
+// 排他を保持したまま処理を実行する。
+//
+// 実行中は保持期間が自動で延長されるため、処理が長引いても排他は保たれる。
+// 排他を他者に奪われた場合は、処理へ渡された context が打ち切られる。
+// 終了時には自動で解放される。
+func ExampleMutex_Do() {
+	cfg := dpf.NewConfiguration()
+	client := dpf.NewAPIClient(cfg)
+	ctx := context.Background()
+
+	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+
+	err := mu.Do(ctx, func(ctx context.Context) error {
+		// ここでレコードを 1 つずつ変更し、ゾーンへ反映する。
+		// この流れでは反映によって排他が解かれないため、復帰後に解放される。
+		return nil
+	})
+	if err != nil {
+		// ErrStillLock: 他者が保持中。ErrNotLockHolder: 保持中に奪われた。
+		fmt.Println(err)
+	}
+}
+
+// ゾーン全体を読んで編集し、一括で置き換える。
+//
+// 取り込みの可否を決めるフラグ（既定はいずれも「取り込む」）の固定、反映によって
+// 排他が解かれることの扱い、非同期処理の完了待ちは ZoneApplier が引き受ける。
+// 利用者が書くのは編集の内容だけである。
+func ExampleZoneApplier_Apply() {
+	cfg := dpf.NewConfiguration()
+	client := dpf.NewAPIClient(cfg)
+	ctx := context.Background()
+
+	ap := utils.NewZoneApplier(
+		client.RecordsAPI, client.ZonesAPI, client.JobsAPI,
+		"zone-id-123456",
+		utils.WithTTL(30*time.Minute),
+	)
+
+	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		// 編集しない要素はそのまま返せばよい。ラベル・TTL・コメントは保たれる。
+		ttl := int32(300)
+		return append(records, dpf.OverwriteRecordsInner{
+			Name:   "www.example.jp.",
+			Ttl:    *dpf.NewNullableInt32(&ttl),
+			Rrtype: dpf.RECORDSRRTYPE_A,
+			Rdata:  []dpf.RecordsRdataInner{{Value: dpf.PtrString("192.0.2.1")}},
+			Labels: map[string]string{},
+		}), nil
+	}, utils.WithApplyDescription("台帳と同期"))
+	if err != nil {
+		// ErrNoRecords: 編集の結果が空だった。
+		fmt.Println(err)
+	}
+}
+
 // owner と TTL を変更してロックを生成する。
 func ExampleNewMutex_options() {
 	cfg := dpf.NewConfiguration()
