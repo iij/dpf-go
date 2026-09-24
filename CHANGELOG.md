@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-24
+
 ### Added
 
 - `utils.Mutex.Do`: 排他を保持したまま処理を実行する。実行中は保持期間を自動で延長し、
@@ -195,7 +197,8 @@
 - Apache License 2.0 のもとで公開。全ファイルに SPDX ライセンス識別子を付与
 - セキュリティポリシー（[`.github/SECURITY.md`](.github/SECURITY.md)）
 
-[Unreleased]: https://github.com/iij/dpf-go/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/iij/dpf-go/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/iij/dpf-go/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iij/dpf-go/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iij/dpf-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/iij/dpf-go/releases/tag/v0.1.0
