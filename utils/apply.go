@@ -13,7 +13,19 @@ import (
 
 // ErrNoRecords は、編集の結果が空だった場合に返される。
 // ゾーンの一括置き換えはレコードを 1 件以上必要とする。
+//
+// 空は「何も変更しない」ことを意味しない。**ゾーンの全削除と区別できないため、失敗として
+// 扱う。** 反映が不要な場合は ErrSkipApply を返すこと。
 var ErrNoRecords = errors.New("dpf: no records to apply")
+
+// ErrSkipApply は、編集の結果を反映しないことを表す合図である。**失敗ではない。**
+//
+// ZoneApplier.Apply は編集関数がこれを返すと、一括置き換えを行わずに排他を解放し、nil を
+// 返す。公開されているレコードを読んだ結果、変える必要が無かった場合に使う。
+//
+// 意味を持つのは ZoneApplier.Apply へ渡す編集関数の戻り値だけである。RunLocked や
+// Mutex.Do へ渡した処理が返した場合は、他のエラーと同じくそのまま呼び出し側へ返る。
+var ErrSkipApply = errors.New("dpf: skip zone apply")
 
 // ZoneRecordsEditor はゾーンへ反映したいレコードの一覧を決める。
 //
@@ -23,6 +35,15 @@ var ErrNoRecords = errors.New("dpf: no records to apply")
 //
 // ctx は ZoneApplier.Apply へ渡されたものから派生しており、排他を他者に奪われた時点で
 // 打ち切られる。外部から情報を読んで編集内容を決める場合は、この打ち切りに従うこと。
+// 打ち切られた場合は ErrSkipApply ではなく ctx.Err() を返すこと。
+//
+// 反映が不要だと分かった場合は ErrSkipApply を返す。一括置き換えは行われず、Apply は nil を
+// 返す。エラーを返す場合、返した一覧は使われない。
+//
+// 省略の判定は errors.Is で行う。このため**包んだ場合、そのメッセージは捨てられる。**
+// Apply は反映したか省略したかを呼び出し側へ返さないため、理由を残したい場合はこの関数の
+// 中で記録するか、クロージャの変数へ控えること。errors.Join(ErrSkipApply, 本物のエラー) を
+// 返してはならない。省略が優先され、もう一方が失われる。
 type ZoneRecordsEditor func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error)
 
 // ZoneApplier はゾーン全体の一括置き換えを、ゾーン単位の排他の下で行う。
@@ -150,13 +171,22 @@ func NewZoneApplier(cr dpf.RecordsApi, cz dpf.ZonesApi, cj dpf.JobsApi, zoneID s
 //
 //  1. 排他を取得する（取得できない場合は ErrStillLock。WithLockWait を指定すれば待つ）
 //  2. 公開されているレコードを取得し、リクエストの形へ変換する
-//  3. edit を呼ぶ。返された一覧が空の場合は ErrNoRecords
+//  3. edit を呼ぶ。ErrSkipApply が返った場合は 4・5 を行わず nil を返す。返された一覧が
+//     空の場合は ErrNoRecords
 //  4. 一括置き換えと反映を行う（SOA と Zone Apex の NS は取り込まない）
 //  5. 反映の完了を待つ
 //
 // 反映が成功した場合、排他は反映によって解かれているため、無条件の解放は行わない。
-// このため**成功した呼び出しが解放に起因して失敗することはない。** 反映より前の
+// このため**反映した呼び出しが解放に起因して失敗することはない。** 反映より前の
 // いずれかの段で失敗した場合は、排他を解放してから返す。
+//
+// 反映を省いた場合（edit が ErrSkipApply を返した場合）は、排他を通常どおり解放してから
+// 返る。**省略は、解放の失敗が戻り値に現れる唯一の成功経路である。** したがって edit が
+// ErrSkipApply を返しても、解放に失敗すればそのエラーが返る。
+//
+// 省略しても、排他の取得・公開されているレコードの取得・解放は行われる（レート制限を
+// 消費する）。減るのは一括置き換えと反映の待ちであり、**公開されているゾーンのシリアルと
+// 履歴が動かない**ことが省略の効果である。
 //
 // edit が返した一覧に SOA レコードまたは Zone Apex の NS レコードが含まれていない
 // 場合は、変換前の一覧のものを補う。いずれも取り込まれないため内容に影響しないが、
@@ -173,8 +203,21 @@ func (a *ZoneApplier) Apply(ctx context.Context, edit ZoneRecordsEditor, opts ..
 		opt(cfg)
 	}
 
+	// 省略の合図を nil へ変換するのは、この関数の**内側**でなければならない。
+	// runLockedHold は処理がエラーを返すと解放のエラーを捨て、排他を失っていた場合は
+	// errors.Join で包んで返す。外側で変換すると、包まれた排他の喪失にも errors.Is が
+	// 一致してしまい、解放の失敗と排他の喪失がどちらも消える。
 	return runLockedHold(ctx, a.locker, func(ctx context.Context, h *hold) error {
-		return a.apply(ctx, h, edit, cfg)
+		err := a.apply(ctx, h, edit, cfg)
+		if errors.Is(err, ErrSkipApply) {
+			// 打ち切られていた場合は省略を成功にしない。省略の経路は API を 1 つも
+			// 呼ばないため、打ち切りが表面化する経路が他に無い。
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			return nil
+		}
+		return err
 	}, a.holdOptions...)
 }
 

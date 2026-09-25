@@ -10,6 +10,7 @@ import (
 
 	dpf "github.com/iij/dpf-go"
 	"github.com/iij/dpf-go/utils"
+	"github.com/miekg/dns"
 )
 
 // ドメイン名から longest match でゾーンを取得する。
@@ -146,8 +147,53 @@ func ExampleZoneApplier_Apply() {
 		}), nil
 	}, utils.WithApplyDescription("台帳と同期"))
 	if err != nil {
-		// ErrNoRecords: 編集の結果が空だった。
+		// ErrNoRecords: 編集の結果が空だった。反映が不要な場合は ErrSkipApply を使う。
 		fmt.Println(err)
+	}
+}
+
+// 反映が不要だった場合は、編集関数から ErrSkipApply を返す。
+//
+// 一括置き換えは行われず、Apply は nil を返す。空の一覧を返すと ErrNoRecords（失敗）に
+// なるため、「変更なし」を空で表してはならない。
+func ExampleZoneApplier_Apply_skipApply() {
+	cfg := dpf.NewConfiguration()
+	client := dpf.NewAPIClient(cfg)
+	ctx := context.Background()
+
+	ap := utils.NewZoneApplier(
+		client.RecordsAPI, client.ZonesAPI, client.JobsAPI,
+		"zone-id-123456",
+	)
+
+	// 反映したか省略したかは Apply の戻り値に現れない。必要なら控えておく。
+	var skipped bool
+	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		// ドメイン名の比較は miekg/dns で正規化してから行う。
+		name := dns.CanonicalName("www.example.jp")
+		for _, r := range records {
+			if r.Rrtype == dpf.RECORDSRRTYPE_A && dns.CanonicalName(r.Name) == name {
+				// 既に目的の状態である。反映しない。
+				skipped = true
+				return nil, utils.ErrSkipApply
+			}
+		}
+
+		ttl := int32(300)
+		return append(records, dpf.OverwriteRecordsInner{
+			Name:   name,
+			Ttl:    *dpf.NewNullableInt32(&ttl),
+			Rrtype: dpf.RECORDSRRTYPE_A,
+			Rdata:  []dpf.RecordsRdataInner{{Value: dpf.PtrString("192.0.2.1")}},
+			Labels: map[string]string{},
+		}), nil
+	})
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	if skipped {
+		fmt.Println("変える必要が無かった")
 	}
 }
 

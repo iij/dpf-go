@@ -241,6 +241,35 @@ func TestZoneApplier_WithReplacedLocker(t *testing.T) {
 	}
 }
 
+// 反映を省いた場合も解放される（FR-018b）。
+//
+// 一括置き換えを呼ばない経路では、レコードを用いる排他でも消費の印が立たない。
+// 差し替えた排他でも既定と同じく通常どおり解放されることを見る。
+func TestZoneApplier_WithReplacedLockerSkipApply(t *testing.T) {
+	env := utils.NewApplyTestEnv(t)
+	m := lockertest.NewMemory(time.Minute)
+	mine, other := m.Pair()
+
+	a := utils.NewZoneApplier(env.Client.RecordsAPI, env.Client.ZonesAPI, env.Client.JobsAPI,
+		env.ZoneID, utils.WithLocker(mine))
+
+	edit := func(context.Context, []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		return nil, utils.ErrSkipApply
+	}
+	if err := a.Apply(t.Context(), edit); err != nil {
+		t.Fatalf("省略は成功として返ること: %v", err)
+	}
+	if n := env.Atomics(); n != 0 {
+		t.Errorf("省略したのに一括置き換えを %d 回呼んでいる", n)
+	}
+	if n := env.Patches(); n != 0 {
+		t.Errorf("SOA への更新が %d 回。差し替えた排他ではレコードを触らないこと", n)
+	}
+	if err := other.Lock(t.Context()); err != nil {
+		t.Fatalf("省略の後に排他が解放されていない: %v", err)
+	}
+}
+
 // 失敗した場合も解放される。
 func TestZoneApplier_WithReplacedLockerReleasesOnFailure(t *testing.T) {
 	env := utils.NewApplyTestEnv(t)

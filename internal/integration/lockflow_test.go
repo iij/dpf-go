@@ -480,6 +480,75 @@ func TestZoneApplierApply(t *testing.T) {
 	}
 }
 
+// TestZoneApplierSkipApply は、編集関数が utils.ErrSkipApply を返したときに反映が行われず、
+// 排他が解放されることを実 API で確認する（specs/007-zone-atomic-apply の FR-018b）。
+//
+// 反映した場合は一括置き換えが排他を解くため、Apply は無条件の解放を行わない。省略した
+// 場合はその経路を通らないため、**解放が通常どおり行われる**。実 API でそこまで通ることを
+// 見る。編集関数はレコードを 1 件足した一覧を番兵とともに返し、そのレコードが作られて
+// いないことで「一覧が使われていない」ことを確かめる。
+//
+// 省略は SOA の未反映の編集（排他のラベル）を残す。取得と解放がゾーン反映を伴わないため
+// であり、反映より前で失敗した場合と同じ状態である。後始末は resetPendingChanges で行う。
+func TestZoneApplierSkipApply(t *testing.T) {
+	logSkipHint(t)
+	c := writeClient(t)
+	ctx := testContext(t)
+	api := c.GetAPIClient()
+	zone := writeZone(t, ctx, c)
+
+	if zone.State != dpf.ZONESSTATE__2 {
+		t.Fatalf("ゾーン %q が公開状態でない（state=%d）", zone.Name, zone.State)
+	}
+	resetPendingChanges(t, ctx, c, zone.Id)
+	t.Cleanup(func() {
+		cctx, cancel := cleanupContext()
+		defer cancel()
+		resetPendingChanges(t, cctx, c, zone.Id)
+	})
+
+	suffix := uniqueSuffix(t)
+	recordName := fmt.Sprintf("_dpf-go-ci-skip-%s.%s", suffix, zoneSubSub)
+	t.Logf("作られてはならないレコード: %s TXT", recordName)
+	t.Cleanup(func() { cleanupRecord(t, c, zone, recordName) })
+
+	ap := utils.NewZoneApplier(api.RecordsAPI, api.ZonesAPI, api.JobsAPI, zone.Id,
+		utils.WithLockOptions(utils.WithOwner(ciLockOwner), utils.WithTTL(5*time.Minute)))
+
+	var sawRecords int
+	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		sawRecords = len(records)
+		// 一覧を返しても、番兵があれば使われない。
+		return append(records, dpf.OverwriteRecordsInner{
+			Name:        recordName,
+			Ttl:         *dpf.NewNullableInt32(dpf.PtrInt32(60)),
+			Rrtype:      dpf.RECORDSRRTYPE_TXT,
+			Rdata:       []dpf.RecordsRdataInner{{Value: dpf.PtrString(dnsprobe.QuoteRdata("skip"))}},
+			Description: "dpf-go integration test",
+			Labels:      map[string]string{},
+		}), utils.ErrSkipApply
+	}, utils.WithApplyDescription("dpf-go ci: skip "+suffix))
+	if err != nil {
+		t.Fatalf("省略は成功として返ること: %v", err)
+	}
+	if sawRecords == 0 {
+		t.Error("編集関数へレコードが渡っていない")
+	}
+
+	// 反映は行われていない。
+	if got := findRecords(t, ctx, c, zone.Id, recordName, dpf.RECORDSRRTYPE_TXT); len(got) != 0 {
+		t.Errorf("省略したのにレコードが作られている: %v", got)
+	}
+
+	// 排他は解放されている。
+	logSOAState(t, ctx, c, zone.Id, "省略の後", ciLockOwner)
+	for _, r := range soaRecords(t, ctx, c, zone.Id) {
+		if r.Labels[utils.LockOwnerLabelKey] == ciLockOwner && !lockExpired(r.Labels) {
+			t.Errorf("省略の後も排他が保持されている: %v", r.Labels)
+		}
+	}
+}
+
 // TestZoneMutexDoRenews は、保持期間より長い処理でも保持が続くことを実 API で確認する
 // （SC-001）。保持期間を短く設定して待ち時間を抑える
 // （specs/007-zone-atomic-apply/quickstart.md 第 4 節の判断）。
