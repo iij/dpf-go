@@ -42,13 +42,63 @@ type ZoneRecordsEditor func(ctx context.Context, records []dpf.OverwriteRecordsI
 //
 // 排他は内部に持ち、公開しない。消費済みの排他を呼び出し側が持ち続けられないように
 // するためである。レコードを 1 つずつ変更してゾーンへ反映する流れでは、この型ではなく
-// Mutex.Do を使うこと。その流れでは反映によって排他が解かれない。
+// RunLocked（または Mutex.Do）を使うこと。その流れでは反映によって排他が解かれない。
+//
+// 排他の仕組みは WithLocker で差し替えられる。差し替えても Apply の呼び出し方と結果は
+// 変わらない。上記 2 は既定のレコードを用いる排他だけの事情であり、外部の仕組みを使う
+// 排他では反映が排他を解かないため、通常どおり解放される。
 type ZoneApplier struct {
-	mu     *Mutex
-	cr     dpf.RecordsApi
-	cz     dpf.ZonesApi
-	cj     dpf.JobsApi
-	zoneID string
+	locker      Locker
+	holdOptions []HoldOption
+	cr          dpf.RecordsApi
+	cz          dpf.ZonesApi
+	cj          dpf.JobsApi
+	zoneID      string
+}
+
+// applierConfig は ZoneApplier の設定。
+type applierConfig struct {
+	locker      Locker
+	lockOptions []Option
+	holdOptions []HoldOption
+}
+
+// ApplierOption は ZoneApplier の任意設定を変更する。
+type ApplierOption func(*applierConfig)
+
+// WithLocker は排他の仕組みを差し替える（デフォルト: レコードを用いる Mutex）。
+//
+// etcd などの分散ロックを使う場合に指定する。指定した場合、WithLockOptions は意味を
+// 持たない（既定の排他を作らないため）。
+//
+// **外部の仕組みを使う排他に替えると、別ユーザや管理画面からの編集を止める効果が
+// 失われる。** 既定のレコードを用いる排他は、編集中のレコードへの他ユーザからの編集を
+// DPF-API が拒否することによって、本ライブラリを使っていない相手にも効く。詳しくは
+// パッケージ文書の比較を参照。
+func WithLocker(l Locker) ApplierOption {
+	return func(c *applierConfig) {
+		if l != nil {
+			c.locker = l
+		}
+	}
+}
+
+// WithLockOptions は既定の排他（レコードを用いる Mutex）への設定を渡す。
+// WithLocker を指定した場合は意味を持たない。
+//
+//	utils.NewZoneApplier(cr, cz, cj, zoneID,
+//		utils.WithLockOptions(utils.WithTTL(30*time.Minute)))
+func WithLockOptions(opts ...Option) ApplierOption {
+	return func(c *applierConfig) {
+		c.lockOptions = append(c.lockOptions, opts...)
+	}
+}
+
+// WithHoldOptions は排他を保持したままの実行への設定を渡す（WithLockWait など）。
+func WithHoldOptions(opts ...HoldOption) ApplierOption {
+	return func(c *applierConfig) {
+		c.holdOptions = append(c.holdOptions, opts...)
+	}
 }
 
 // applyConfig は Apply 1 回分の設定。
@@ -72,22 +122,25 @@ func WithApplyDescription(description string) ApplyOption {
 //   - cj     : JOB API（*dpf.JobsAPIService が利用できる）
 //   - zoneID : 対象ゾーンの ID
 //
-// opts は排他の設定であり、そのまま内部の Mutex へ渡される。保持者・保持期間・
-// 延長の間隔・取得の待機を指定できる（WithOwner / WithTTL / WithRenewInterval /
-// WithLockWait など）。
-func NewZoneApplier(cr dpf.RecordsApi, cz dpf.ZonesApi, cj dpf.JobsApi, zoneID string, opts ...Option) *ZoneApplier {
-	return &ZoneApplier{
-		mu:     NewMutex(cr, zoneID, opts...),
-		cr:     cr,
-		cz:     cz,
-		cj:     cj,
-		zoneID: zoneID,
+// opts で排他の仕組みを差し替えたり（WithLocker）、既定の排他へ設定を渡したり
+// （WithLockOptions）できる。指定しない場合は、レコードを用いる排他が使われる。
+func NewZoneApplier(cr dpf.RecordsApi, cz dpf.ZonesApi, cj dpf.JobsApi, zoneID string, opts ...ApplierOption) *ZoneApplier {
+	cfg := &applierConfig{}
+	for _, opt := range opts {
+		opt(cfg)
 	}
-}
+	if cfg.locker == nil {
+		cfg.locker = NewMutex(cr, zoneID, cfg.lockOptions...)
+	}
 
-// Owner は排他の保持者を表す値を返す。診断のために公開している。
-func (a *ZoneApplier) Owner() string {
-	return a.mu.Owner()
+	return &ZoneApplier{
+		locker:      cfg.locker,
+		holdOptions: cfg.holdOptions,
+		cr:          cr,
+		cz:          cz,
+		cj:          cj,
+		zoneID:      zoneID,
+	}
 }
 
 // Apply は排他を取得し、公開されているレコードを edit へ渡し、その結果でゾーン全体を
@@ -120,9 +173,9 @@ func (a *ZoneApplier) Apply(ctx context.Context, edit ZoneRecordsEditor, opts ..
 		opt(cfg)
 	}
 
-	return a.mu.doHold(ctx, func(ctx context.Context, h *hold) error {
+	return runLockedHold(ctx, a.locker, func(ctx context.Context, h *hold) error {
 		return a.apply(ctx, h, edit, cfg)
-	})
+	}, a.holdOptions...)
 }
 
 // apply は排他の保護下で行う本体。
@@ -141,10 +194,15 @@ func (a *ZoneApplier) apply(ctx context.Context, h *hold, edit ZoneRecordsEditor
 	}
 	edited = fillRequiredRecords(edited, current)
 
-	// この先の一括置き換えが排他を解く。自動延長を止め、終了時の無条件の解放を
-	// 行わないようにする。この位置より早いと編集中の延長が止まり、遅いと反映中に
-	// 延長が走って、作り直される SOA を掴もうとする。
-	h.consume()
+	// 一括置き換えが排他を解く実装（レコードを用いる排他）では、自動延長を止め、
+	// 終了時の無条件の解放を行わないようにする。この位置より早いと編集中の延長が
+	// 止まり、遅いと反映中に延長が走って、作り直される SOA を掴もうとする。
+	//
+	// 排他が解かれない実装（外部の仕組みを使うもの）では何もしない。延長は反映の
+	// 最中も続き、終了時に通常どおり解放される。呼び出し側から見た違いは無い。
+	if consumesLockOnZoneApply(a.locker) {
+		h.consume()
+	}
 
 	body := dpf.PatchZoneAtomicChanges{
 		Records:             edited,

@@ -1391,7 +1391,7 @@ func TestMutexDo_RenewLoopStopped(t *testing.T) {
 	// doHold を直接呼び、保持の状態を取り出す。Do が復帰した時点で延長の
 	// goroutine が終了していることを、done が閉じていることで確かめる。
 	var h *hold
-	err := m.doHold(context.Background(), func(ctx context.Context, hh *hold) error {
+	err := runLockedHold(context.Background(), m, func(ctx context.Context, hh *hold) error {
 		h = hh
 		return nil
 	})
@@ -1419,7 +1419,7 @@ func TestMutexDo_LockWaitRetries(t *testing.T) {
 	now := fixedNow()
 	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
 	c := newLockClient(t, s)
-	m := doMutex(c, "alice", now, WithLockWait(5*time.Millisecond))
+	m := doMutex(c, "alice", now)
 
 	// 少し経ってから他者の排他が期限切れになる状況を作る。
 	go func() {
@@ -1433,7 +1433,7 @@ func TestMutexDo_LockWaitRetries(t *testing.T) {
 	if err := m.Do(context.Background(), func(ctx context.Context) error {
 		called = true
 		return nil
-	}); err != nil {
+	}, WithLockWait(5*time.Millisecond)); err != nil {
 		t.Fatalf("待機の指定があれば取得できるまで繰り返すこと: %v", err)
 	}
 	if !called {
@@ -1445,7 +1445,7 @@ func TestMutexDo_LockWaitHonorsCancel(t *testing.T) {
 	now := fixedNow()
 	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
 	c := newLockClient(t, s)
-	m := doMutex(c, "alice", now, WithLockWait(5*time.Millisecond))
+	m := doMutex(c, "alice", now)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
@@ -1454,7 +1454,7 @@ func TestMutexDo_LockWaitHonorsCancel(t *testing.T) {
 	err := m.Do(ctx, func(ctx context.Context) error {
 		called = true
 		return nil
-	})
+	}, WithLockWait(5*time.Millisecond))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("context.DeadlineExceeded を期待したが %v", err)
 	}
