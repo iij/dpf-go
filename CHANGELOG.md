@@ -10,6 +10,8 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-25
+
 ### Added
 
 - `utils.Locker`: ゾーン単位の排他の抽象。`Lock` / `Renew` / `Unlock` の 3 つだけを求める。
@@ -255,7 +257,8 @@
 - Apache License 2.0 のもとで公開。全ファイルに SPDX ライセンス識別子を付与
 - セキュリティポリシー（[`.github/SECURITY.md`](.github/SECURITY.md)）
 
-[Unreleased]: https://github.com/iij/dpf-go/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/iij/dpf-go/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/iij/dpf-go/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/iij/dpf-go/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/iij/dpf-go/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/iij/dpf-go/compare/v0.1.0...v0.2.0
