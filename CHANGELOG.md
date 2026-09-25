@@ -10,6 +10,64 @@
 
 ## [Unreleased]
 
+### Added
+
+- `utils.Locker`: ゾーン単位の排他の抽象。`Lock` / `Renew` / `Unlock` の 3 つだけを求める。
+  既定は従来どおり DPF-API のレコードを用いる `utils.Mutex` だが、etcd などの分散ロックを
+  実装して差し替えられる。仕様は `specs/008-pluggable-lock` を参照
+  - **外部の仕組みを使う排他に替えると、別ユーザや管理画面からの編集を止める効果が失われる。**
+    既定のレコードを用いる排他は、編集中のレコードへの他ユーザからの編集を DPF-API が拒否する
+    ことによって、本ライブラリを使っていない相手にも効く。2 つの方式の比較は `utils` の
+    パッケージ文書を参照
+  - **1 つの値は 1 つのゾーンに対する 1 つの保持者を表す。** どのゾーンに対応するかを決める
+    責任は実装の側にあり、本パッケージは取り違えを検出できない
+- `utils.RunLocked`: 任意の排他を保持したまま処理を実行する。`utils.Mutex.Do` と同じ約束を
+  `utils.Locker` に対して提供する。`Mutex.Do` はこの薄い包みとして残る
+- `utils.RenewIntervaler`: 延長の間隔を申告する任意のインターフェース。実装しなくてもよい。
+  `utils.Mutex` は保持期間の 1/3 を申告する
+- `utils.HoldOption` / `utils.WithRenewEvery`（延長の間隔。排他の申告を上書きする）/
+  `utils.DefaultRenewInterval`（5 分。排他が申告しない場合に使う）
+- `utils.ApplierOption` / `utils.WithLocker`（`ZoneApplier` の排他を差し替える）/
+  `utils.WithLockOptions`（既定の排他への設定）/ `utils.WithHoldOptions`（実行への設定）
+- `utils/lockertest`: 自作の `utils.Locker` が契約を満たすかを機械的に確かめる `Run` と、
+  メモリ内の参照実装 `NewMemory` を提供する。`testing` を `utils` へ持ち込まないために
+  別パッケージにしている
+  - 再入の禁止、取得を待たないこと、`Renew` での保持の喪失の報告、他者の排他を解放しない
+    ことなど、取り違えやすい約束を項目ごとに確かめる
+
+### Changed
+
+- **破壊的変更**: `utils.NewZoneApplier` の可変長引数の型を `utils.Option` から
+  `utils.ApplierOption` へ変更した。排他への設定は `utils.WithLockOptions` で包む
+
+  ```go
+  // v0.4.0
+  utils.NewZoneApplier(cr, cz, cj, zoneID, utils.WithTTL(30*time.Minute))
+  // 以降
+  utils.NewZoneApplier(cr, cz, cj, zoneID,
+      utils.WithLockOptions(utils.WithTTL(30*time.Minute)))
+  ```
+
+- **破壊的変更**: `utils.WithLockWait` を `utils.Option`（`NewMutex` に渡す）から
+  `utils.HoldOption`（`Do` / `RunLocked` に渡す）へ変更した。待機は排他の性質ではなく
+  実行 1 回ごとの判断であるためである。`utils.Mutex.LockWait` は従来どおり使える
+
+  ```go
+  // v0.4.0
+  mu := utils.NewMutex(cr, zoneID, utils.WithLockWait(5*time.Second))
+  err := mu.Do(ctx, fn)
+  // 以降
+  mu := utils.NewMutex(cr, zoneID)
+  err := mu.Do(ctx, fn, utils.WithLockWait(5*time.Second))
+  ```
+
+- **破壊的変更**: `utils.ZoneApplier.Owner` を削除した。排他を差し替えられるようになり、
+  保持者を表す値を持たない実装がありうるためである。既定の排他の保持者を知りたい場合は、
+  `utils.NewMutex` で作った排他を `utils.WithLocker` で渡し、その `Owner` を参照する
+- `utils.Mutex.Do` は `utils.RunLocked` の薄い包みになった。呼び出し方と挙動は変わらない
+- `utils.WithRenewInterval` は「この排他が申告する延長の間隔」を指定する Option になった。
+  `NewMutex` に渡す点も既定（保持期間の 1/3）も変わらない
+
 ## [0.4.0] - 2026-09-24
 
 ### Added

@@ -427,7 +427,7 @@ func TestZoneApplierApply(t *testing.T) {
 
 	// ZoneApplier でレコードを 1 件足す。
 	ap := utils.NewZoneApplier(api.RecordsAPI, api.ZonesAPI, api.JobsAPI, zone.Id,
-		utils.WithOwner(ciLockOwner), utils.WithTTL(5*time.Minute))
+		utils.WithLockOptions(utils.WithOwner(ciLockOwner), utils.WithTTL(5*time.Minute)))
 
 	var sawSOA bool
 	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {

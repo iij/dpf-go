@@ -131,7 +131,7 @@ func ExampleZoneApplier_Apply() {
 	ap := utils.NewZoneApplier(
 		client.RecordsAPI, client.ZonesAPI, client.JobsAPI,
 		"zone-id-123456",
-		utils.WithTTL(30*time.Minute),
+		utils.WithLockOptions(utils.WithTTL(30*time.Minute)),
 	)
 
 	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
@@ -240,3 +240,85 @@ func ExampleWithTokenProvider() {
 func fetchTokenFromVault(context.Context) (string, error) {
 	return "token-from-vault", nil
 }
+
+// 排他の仕組みを差し替えて、排他の下で処理を実行する。
+//
+// 既に etcd や Consul で排他を運用している環境では、そちらへ寄せられる。呼び出し方は
+// 既定の排他と変わらない。**ただし、外部の仕組みを使う排他には、別ユーザや管理画面
+// からの編集を止める効果は無い。** 詳しくはパッケージ文書の比較を参照。
+func ExampleRunLocked() {
+	ctx := context.Background()
+
+	// 自作の排他（下の myLocker を参照）。ゾーンとの対応づけは実装の責任である。
+	locker := newMyLocker("zone-id-123456")
+
+	err := utils.RunLocked(ctx, locker, func(ctx context.Context) error {
+		// ここでレコードを編集し、ゾーンへ反映する。
+		// 排他を他者に奪われた場合、この ctx は打ち切られる。
+		return nil
+	}, utils.WithLockWait(5*time.Second))
+	if err != nil {
+		// ErrStillLock: 取得できなかった。ErrNotLockHolder: 実行中に失った。
+		fmt.Println(err)
+	}
+}
+
+// ゾーン全体の一括置き換えで、排他の仕組みを差し替える。
+//
+// WithLocker を指定した場合、既定の排他への設定（WithLockOptions）は意味を持たない。
+func ExampleWithLocker() {
+	cfg := dpf.NewConfiguration()
+	client := dpf.NewAPIClient(cfg)
+	ctx := context.Background()
+
+	ap := utils.NewZoneApplier(
+		client.RecordsAPI, client.ZonesAPI, client.JobsAPI,
+		"zone-id-123456",
+		utils.WithLocker(newMyLocker("zone-id-123456")),
+	)
+
+	err := ap.Apply(ctx, func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		return records, nil
+	})
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+// myLocker は自作の排他の骨格。実際には etcd などの分散ロックを呼ぶ。
+//
+// 契約（utils.Locker の godoc）を満たすこと。特に、取得は待たないこと、再入を
+// 許さないこと、Renew で保持の喪失を報告することの 3 つを取り違えやすい。
+// 実装できたら utils/lockertest の Run で確かめること。
+type myLocker struct {
+	key string
+}
+
+func newMyLocker(zoneID string) *myLocker {
+	// 鍵にはゾーンを識別できる値を含める。複数のゾーンを 1 つの鍵で守ると、
+	// 無関係なゾーンの操作まで直列になる。
+	return &myLocker{key: "dpf-go/zone/" + zoneID}
+}
+
+// Lock は取得を 1 回だけ試みる。保持されている場合は待たずに返す。
+func (l *myLocker) Lock(ctx context.Context) error {
+	// 例: etcd の concurrency.Mutex.TryLock を呼び、
+	// concurrency.ErrLocked なら utils.ErrStillLock を返す。
+	return nil
+}
+
+// Renew は保持を確かめ、必要なら期限を延ばす。失っていれば報告する。
+func (l *myLocker) Renew(ctx context.Context) error {
+	// 例: etcd ではセッションが生きているかを見る（リースの更新は自動で行われる）。
+	// 失っていれば utils.ErrNotLockHolder を返す。これを怠ると、排他を失ったまま
+	// 処理が走り続ける。
+	return nil
+}
+
+// Unlock は自分が保持者である場合に限り解放する。
+func (l *myLocker) Unlock(ctx context.Context) error {
+	return nil
+}
+
+// RenewInterval は延長の間隔を申告する（任意）。保持期間から導ける場合は実装する。
+func (l *myLocker) RenewInterval() time.Duration { return 10 * time.Second }

@@ -38,9 +38,11 @@ func testApplier(c *dpf.APIClient, owner string, now time.Time, opts ...Option) 
 		WithVerifyTimeout(20 * time.Millisecond),
 		WithRenewInterval(10 * time.Millisecond),
 	}, opts...)
-	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID, opts...)
-	a.mu.now = func() time.Time { return now }
-	a.mu.pollInterval = time.Millisecond
+	// 排他の設定は WithLockOptions で包んで渡す（008 の移行）。
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID, WithLockOptions(opts...))
+	mu := a.locker.(*Mutex)
+	mu.now = func() time.Time { return now }
+	mu.pollInterval = time.Millisecond
 	return a
 }
 
@@ -350,8 +352,8 @@ func TestZoneApplier_Options(t *testing.T) {
 		t.Errorf("コメントが渡っていない: %v", s.atomicBody.Description)
 	}
 	// 排他の Option が内部の排他へ渡っている。
-	if a.Owner() != "deployer" {
-		t.Errorf("保持者が %q（WithOwner が渡っていない）", a.Owner())
+	if owner := a.locker.(*Mutex).Owner(); owner != "deployer" {
+		t.Errorf("保持者が %q（WithOwner が渡っていない）", owner)
 	}
 }
 
@@ -366,5 +368,128 @@ func TestZoneApplier_NilEditor(t *testing.T) {
 	}
 	if s.patches != 0 {
 		t.Errorf("排他の取得を試みた（PATCH %d 回）", s.patches)
+	}
+}
+
+// ---- 外部テストパッケージ向けの窓口 (T020) ----
+
+// ApplyTestEnv は package utils_test から模擬サーバを使うための窓口である。
+//
+// 参照実装（utils/lockertest）を使うテストは、循環参照を避けるため package utils_test
+// に置く必要がある。模擬サーバは本ファイル（package utils）にあり、外部テストパッケージ
+// からは非公開の識別子を参照できないため、必要な操作だけをここで公開する。
+type ApplyTestEnv struct {
+	Client *dpf.APIClient
+	ZoneID string
+	s      *lockServer
+}
+
+// NewApplyTestEnv は一括置き換えを検証できる模擬環境を返す。
+func NewApplyTestEnv(t *testing.T) *ApplyTestEnv {
+	t.Helper()
+	s := applyServer(map[string]string{})
+	return &ApplyTestEnv{Client: newLockClient(t, s), ZoneID: testZoneID, s: s}
+}
+
+// Atomics は一括置き換えが呼ばれた回数を返す。
+func (e *ApplyTestEnv) Atomics() int {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	return e.s.atomics
+}
+
+// Patches はレコードの更新が呼ばれた回数を返す。レコードを用いる排他を使っていない
+// ことの確認に使う（差し替えた場合、SOA への更新は行われない）。
+func (e *ApplyTestEnv) Patches() int {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	return e.s.patches
+}
+
+// OverwriteFlags は直近の一括置き換えのフラグを返す。
+func (e *ApplyTestEnv) OverwriteFlags() (soa, apexNS *bool) {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	if e.s.atomicBody == nil {
+		return nil, nil
+	}
+	return e.s.atomicBody.OverwriteSoa, e.s.atomicBody.OverwriteZoneApexNs
+}
+
+// SOALabels は SOA レコードのラベルの複製を返す。
+func (e *ApplyTestEnv) SOALabels() map[string]string {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range e.s.find(testSOAID).labels {
+		out[k] = v
+	}
+	return out
+}
+
+// ---- 排他の差し替え (T021) ----
+
+// noopLocker は何もしない差し替えの実装。どちらの Option が効いたかだけを見るために使う。
+type noopLocker struct{}
+
+func (noopLocker) Lock(context.Context) error   { return nil }
+func (noopLocker) Renew(context.Context) error  { return nil }
+func (noopLocker) Unlock(context.Context) error { return nil }
+
+func TestNewZoneApplier_WithLockerIgnoresLockOptions(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	want := noopLocker{}
+
+	// 指定の順序によらず、WithLocker が勝つ。
+	cases := []struct {
+		name string
+		opts []ApplierOption
+	}{
+		{"WithLockOptions が先", []ApplierOption{
+			WithLockOptions(WithOwner("alice")), WithLocker(want)}},
+		{"WithLocker が先", []ApplierOption{
+			WithLocker(want), WithLockOptions(WithOwner("alice"))}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID, tc.opts...)
+			if a.locker != want {
+				t.Fatalf("排他が %T。WithLocker で渡したものが使われていない", a.locker)
+			}
+			if _, ok := a.locker.(*Mutex); ok {
+				t.Error("WithLockOptions によってレコードを用いる排他が作られている")
+			}
+		})
+	}
+}
+
+// WithLocker に nil を渡しても既定の排他が使われる（FR-006）。
+func TestNewZoneApplier_NilLockerFallsBack(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID, WithLocker(nil))
+	if _, ok := a.locker.(*Mutex); !ok {
+		t.Fatalf("排他が %T。既定はレコードを用いる排他であること", a.locker)
+	}
+}
+
+// ---- 既定の排他 (T028) ----
+
+// WithLocker を指定しない場合はレコードを用いる排他が使われ、対象のゾーンも引き継がれる。
+func TestNewZoneApplier_DefaultsToRecordMutex(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID)
+
+	mu, ok := a.locker.(*Mutex)
+	if !ok {
+		t.Fatalf("排他が %T。既定はレコードを用いる排他であること", a.locker)
+	}
+	if mu.zoneID != testZoneID {
+		t.Errorf("排他のゾーンが %q、期待は %q", mu.zoneID, testZoneID)
+	}
+	if !consumesLockOnZoneApply(mu) {
+		t.Error("既定の排他が「一括置き換えで解かれる」と申告していない")
 	}
 }

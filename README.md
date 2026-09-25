@@ -85,7 +85,7 @@ go run .
 | パッケージ | 内容 |
 |---|---|
 | [`dpf`](https://pkg.go.dev/github.com/iij/dpf-go) | 生成された API クライアント。認証、`ExecuteAll()`、`SyncWait()`、エラーの扱い、OpenTelemetry |
-| [`dpf/utils`](https://pkg.go.dev/github.com/iij/dpf-go/utils) | クライアントラッパー（レート制限・リトライ・トークン管理）、ゾーン／レコード取得、ゾーン単位ロック、排他を保持したままの処理実行（自動延長つき）、ゾーン全体の一括置き換え |
+| [`dpf/utils`](https://pkg.go.dev/github.com/iij/dpf-go/utils) | クライアントラッパー（レート制限・リトライ・トークン管理）、ゾーン／レコード取得、ゾーン単位ロック（etcd などへ差し替え可能）、排他を保持したままの処理実行（自動延長つき）、ゾーン全体の一括置き換え |
 | [`misc/vault`](https://pkg.go.dev/github.com/iij/dpf-go/misc/vault) | HashiCorp Vault (KV v1/v2) からトークンを取得 |
 | [`misc/aws`](https://pkg.go.dev/github.com/iij/dpf-go/misc/aws) | AWS Secrets Manager からトークンを取得 |
 | [`misc/azure`](https://pkg.go.dev/github.com/iij/dpf-go/misc/azure) | Azure Key Vault からトークンを取得 |
