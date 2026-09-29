@@ -139,7 +139,7 @@ func WithApplyDescription(description string) ApplyOption {
 //   - zoneID : 対象ゾーンの ID
 //
 // opts で排他の仕組みを差し替えたり（WithLocker）、既定の排他へ設定を渡したり
-// （WithLockOptions）できる。指定しない場合は、レコードを用いる排他が使われる。
+// （WithLockOptions）できる。指定しない場合は、ゾーンのラベルを用いる既定の排他が使われる。
 func NewZoneApplier(cr dpf.RecordsApi, cz dpf.ZonesApi, cj dpf.JobsApi, zoneID string, opts ...ApplierOption) *ZoneApplier {
 	cfg := &applierConfig{}
 	for _, opt := range opts {
