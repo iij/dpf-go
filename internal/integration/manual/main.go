@@ -65,7 +65,7 @@ func run(at string, hold, ttl time.Duration, cleanup bool) error {
 			serviceCode, zone.Name, writeZoneName)
 	}
 
-	mu := utils.NewMutex(api.RecordsAPI, zone.Id, utils.WithTTL(ttl))
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id, utils.WithTTL(ttl))
 
 	// 開始時刻を揃える。ここまでで接続は確立しているため、待機の後は
 	// ただちに最初の問い合わせが飛ぶ。

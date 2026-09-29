@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -15,6 +17,7 @@ import (
 	dpf "github.com/iij/dpf-go"
 	"github.com/iij/dpf-go/internal/dnsprobe"
 	"github.com/iij/dpf-go/utils"
+	"github.com/miekg/dns"
 )
 
 // 本ファイルは、ゾーン単位の排他を保持したままゾーンを反映する 2 つの流れを、
@@ -22,33 +25,38 @@ import (
 // 「取得の後にレコードを編集し、取得した SOA レコードをそのままゾーンへ反映する」が
 // 実際に成立するかを見る。
 //
-// 最大の関心は、反映の後に SOA レコードがどの状態になるかである。
+// 最大の関心は、**反映の後に排他が保持されたままかどうか**である。
 //
-//   - 編集予定 (state=3) のまま残る → 排他は保持されたまま。Unlock で解放できる
-//   - 反映済み (state=0) でロックのラベルを保つ → 排他は保持されたまま。
-//     Unlock は新たな編集予定を作って解放する
-//   - 反映済み (state=0) でロックのラベルが消える → **排他が黙って失われる**。
-//     編集の途中で他者がロックを取得できてしまう
+// 009-zone-label-lock で排他の状態がゾーンのラベルへ移り、**どちらの反映方法でも排他は
+// 影響を受けなくなった。** ゾーンのラベルはレコードとは別のリソースであり、未反映の編集の
+// 概念も持たないためである。本ファイルはその性質を固定する。
 //
-// 2026-09-18 の実測では、一括置き換え（PatchZoneAtomicChanges）が 3 つ目、
-// 編集中レコードのゾーン反映（PatchZoneChanges）が 2 つ目であった。前者はロックと
-// 併用できない。ロックのラベルは SOA の「未反映の編集」としてのみ存在し、一括置き換えは
-// 未反映の編集を引き継がないためである。overwrite_soa の値は関係しない。
-// 本ファイルはその違いを固定する。一括置き換えを安全に行う手段は utils.ZoneApplier で
-// あり、その確認も本ファイルで行う。
+// v0.5.0 までは排他の状態が SOA の未反映の編集としてのみ存在したため、一括置き換え
+// （PatchZoneAtomicChanges）で排他が黙って失われていた（2026-09-18 の実測、
+// specs/007-zone-atomic-apply/research.md D1）。本ファイルの期待値はその反転である。
+//
+// あわせて、排他がゾーンに未反映の編集を作らないこと、レコードのラベルを触らないことも
+// 見る（009 FR-001〜FR-003）。
 
-// logSOAState は SOA レコードの state とロックのラベルを出力する。
+// logLockState はゾーンのラベルの排他と、SOA レコードの state を出力する。
 // 戻り値は、**有効な排他を自分が保持しているか**である。
 //
-// owner の一致だけでは足りない。ゾーン反映を伴う流れでは、過去の実行が残した
-// ロックのラベルが反映済みとして残ることがある。同じ owner を使っていると、
-// 期限切れの残骸を「保持している」と誤判定してしまう。
-func logSOAState(t *testing.T, ctx context.Context, c *utils.Client, zoneID, phase, owner string) bool {
+// owner の一致だけでは足りない。過去の実行が残したラベル（奪ってよい時刻が過去）が
+// 残っているため、同じ owner を使っていると期限切れの残骸を「保持している」と
+// 誤判定してしまう。
+//
+// SOA の state も出すのは、**排他がレコードを触っていないこと**を目で確かめられるように
+// するためである（009 以降、排他は SOA を編集予定にしない）。
+func logLockState(t *testing.T, ctx context.Context, c *utils.Client, zoneID, phase, owner string) bool {
 	t.Helper()
 
-	held := false
-	recs := soaRecords(t, ctx, c, zoneID)
-	for _, r := range recs {
+	v := zoneLockLabel(t, ctx, c, zoneID)
+	gotOwner, deadline, ok := parseZoneLock(v)
+	held := ok && gotOwner == owner && time.Now().Unix() < deadline
+	t.Logf("[%s] ゾーンのラベル %s=%q (owner=%q deadline=%d 解釈可=%t)",
+		phase, utils.ZoneLockLabelKey, v, gotOwner, deadline, ok)
+
+	for _, r := range soaRecords(t, ctx, c, zoneID) {
 		state := map[dpf.RecordsState]string{
 			dpf.RECORDSSTATE__0: "反映済み",
 			dpf.RECORDSSTATE__1: "追加予定",
@@ -56,19 +64,48 @@ func logSOAState(t *testing.T, ctx context.Context, c *utils.Client, zoneID, pha
 			dpf.RECORDSSTATE__3: "更新予定",
 			dpf.RECORDSSTATE__5: "更新前の状態",
 		}[r.State]
-		t.Logf("[%s] SOA: id=%s state=%d(%s) owner=%q deadline=%q",
-			phase, r.Id, r.State, state,
-			r.Labels[utils.LockOwnerLabelKey], r.Labels[utils.LockDeadlineLabelKey])
-		if r.Labels[utils.LockOwnerLabelKey] == owner && !lockExpired(r.Labels) {
-			held = true
-		}
+		t.Logf("[%s] SOA: id=%s state=%d(%s) labels=%v", phase, r.Id, r.State, state, r.Labels)
 	}
-	if len(recs) == 0 {
-		t.Errorf("[%s] SOA レコードが 1 件も見つからない", phase)
-	}
-	t.Logf("[%s] 未反映件数=%d ロックのラベル(owner=%s)=%t",
+	t.Logf("[%s] 未反映件数=%d 排他の保持(owner=%s)=%t",
 		phase, pendingCount(t, ctx, c, zoneID), owner, held)
 	return held
+}
+
+// zoneLockLabel はゾーンのラベルから排他の値を読む。無い場合は空文字。
+func zoneLockLabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) string {
+	t.Helper()
+	return zoneLabelsOfZone(t, ctx, c, zoneID)[utils.ZoneLockLabelKey]
+}
+
+// zoneLabelsOfZone はゾーンのラベルを取得する。
+func zoneLabelsOfZone(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) map[string]string {
+	t.Helper()
+	res, _, err := c.GetAPIClient().ZonesAPI.GetZoneLabels(ctx, zoneID).Execute()
+	if err != nil {
+		t.Fatalf("ゾーンのラベルを取得できない: %v", err)
+	}
+	if res == nil {
+		t.Fatal("ゾーンのラベルの応答が空である")
+	}
+	return res.Result.Labels
+}
+
+// parseZoneLock は排他の値を読み出す。形式は utils.ZoneLockLabelKey の godoc を参照。
+// **右端から固定幅で読む**（末尾 10 桁が奪ってよい時刻、その手前 1 文字が区切り）。
+func parseZoneLock(v string) (owner string, deadline int64, ok bool) {
+	const digits = 10
+	if len(v) < 1+1+digits {
+		return "", 0, false
+	}
+	sepAt := len(v) - digits - 1
+	if v[sepAt] != '-' {
+		return "", 0, false
+	}
+	d, err := strconv.ParseInt(v[sepAt+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return v[:sepAt], d, true
 }
 
 // assertStillLocked は、ロックが自分に保持されたままであることを確認する。
@@ -77,7 +114,7 @@ func logSOAState(t *testing.T, ctx context.Context, c *utils.Client, zoneID, pha
 func assertStillLocked(t *testing.T, ctx context.Context, c *utils.Client, zoneID, phase string) {
 	t.Helper()
 
-	other := utils.NewMutex(c.GetAPIClient().RecordsAPI, zoneID,
+	other := utils.NewMutex(c.GetAPIClient().RecordsAPI, c.GetAPIClient().ZonesAPI, zoneID,
 		utils.WithOwner("someone-else"),
 		utils.WithTTL(2*time.Minute))
 	err := other.Lock(ctx)
@@ -91,70 +128,43 @@ func assertStillLocked(t *testing.T, ctx context.Context, c *utils.Client, zoneI
 	}
 
 	t.Errorf("[%s] 別 owner が排他を取得できてしまった。"+
-		"この反映方法はロックを保持したまま使えない", phase)
+		"排他はゾーンのラベルにあり、反映の影響を受けないこと", phase)
 	if err := other.Unlock(ctx); err != nil {
 		t.Errorf("[%s] 奪った排他を解放できない: %v", phase, err)
 	}
 }
 
-// lockExpired は、奪ってよい時刻を過ぎている（または判定できない）かを返す。
-func lockExpired(labels map[string]string) bool {
-	v, ok := labels[utils.LockDeadlineLabelKey]
+// lockExpired は、排他の値が示す奪ってよい時刻を過ぎている（または判定できない）かを返す。
+func lockExpired(v string) bool {
+	_, deadline, ok := parseZoneLock(v)
 	if !ok {
-		return true
-	}
-	deadline, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
 		return true
 	}
 	return time.Now().Unix() >= deadline
 }
 
-// clearSOALock は SOA からロックのラベルを取り除いて反映する。
+// clearZoneLock はゾーンのラベルから排他を取り除く。
 //
-// ゾーン反映を伴う流れでは、ロックのラベルが反映済みになる。その後の Unlock は
-// 未反映の編集を作るため、これを破棄すると「奪ってよい時刻が未来の排他」が反映済みと
-// して残り、ゾーンが保持期間のあいだロックされたままになる。実際にこの後始末の誤りで、
-// 後続のテストが 5 分間ずっと ErrStillLock で落ちた。ゾーン反映を行うテストでは、
-// discardSOAChanges ではなくこちらを使う。
-func clearSOALock(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) {
+// **ゾーン反映は不要である。** ゾーンのラベルは未反映の編集の概念を持たないため、
+// 取り除いた時点で確定する（009）。排他を残したまま次のテストへ渡さないための後始末で
+// あり、通常の解放（奪ってよい時刻を現在時刻にする）とは別物である。
+func clearZoneLock(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) {
 	t.Helper()
 
-	recs := soaRecords(t, ctx, c, zoneID)
-	if len(recs) == 0 {
+	labels := zoneLabelsOfZone(t, ctx, c, zoneID)
+	if _, ok := labels[utils.ZoneLockLabelKey]; !ok {
 		return
 	}
-	// 編集予定があればそれを、無ければ反映済みを対象にする。
-	target := recs[0]
-	for _, r := range recs {
-		if r.State == dpf.RECORDSSTATE__3 {
-			target = r
-			break
+	rest := map[string]string{}
+	for k, v := range labels {
+		if k != utils.ZoneLockLabelKey {
+			rest[k] = v
 		}
 	}
-
-	_, hasOwner := target.Labels[utils.LockOwnerLabelKey]
-	_, hasDeadline := target.Labels[utils.LockDeadlineLabelKey]
-	pending := pendingCount(t, ctx, c, zoneID)
-	if !hasOwner && !hasDeadline && pending == 0 {
-		return
-	}
-
-	labels := map[string]string{}
-	for k, v := range target.Labels {
-		if k != utils.LockOwnerLabelKey && k != utils.LockDeadlineLabelKey {
-			labels[k] = v
-		}
-	}
-	t.Logf("後始末: SOA (id=%s) からロックのラベルを取り除いて反映する", target.Id)
-	syncWaiter(t, c, "ロックのラベルの除去")(
-		c.GetAPIClient().RecordsAPI.PatchRecord(ctx, zoneID, target.Id).
-			PatchRecord(dpf.PatchRecord{Labels: &labels}).Execute())
-	applyZone(t, ctx, c, zoneID, pendingCount(t, ctx, c, zoneID), "dpf-go ci: clear soa lock")
-
-	if n := pendingCount(t, ctx, c, zoneID); n != 0 {
-		t.Errorf("後始末後も未反映の編集が %d 件残っている", n)
-	}
+	t.Logf("後始末: ゾーンのラベルから排他 (%s) を取り除く", utils.ZoneLockLabelKey)
+	syncWaiter(t, c, "排他のラベルの除去")(
+		c.GetAPIClient().ZonesAPI.PutZoneLabels(ctx, zoneID).
+			ZoneLabels(dpf.ZoneLabels{Labels: rest}).Execute())
 }
 
 // assertLockLost は、排他が失われていることを確認する。
@@ -162,7 +172,7 @@ func clearSOALock(t *testing.T, ctx context.Context, c *utils.Client, zoneID str
 func assertLockLost(t *testing.T, ctx context.Context, c *utils.Client, zoneID, phase string) {
 	t.Helper()
 
-	other := utils.NewMutex(c.GetAPIClient().RecordsAPI, zoneID,
+	other := utils.NewMutex(c.GetAPIClient().RecordsAPI, c.GetAPIClient().ZonesAPI, zoneID,
 		utils.WithOwner("someone-else"),
 		utils.WithTTL(2*time.Minute))
 	if err := other.Lock(ctx); err != nil {
@@ -204,14 +214,17 @@ func overwriteRecordsFromCurrents(t *testing.T, ctx context.Context, c *utils.Cl
 	return out
 }
 
-// TestLockFlow_AtomicChangesLosesLock は、一括置き換え（PatchZoneAtomicChanges）が
-// 排他を解くことを固定する。overwrite_soa は false で実行する。
+// TestLockFlow_AtomicChangesKeepsLock は、レコードの一括更新とゾーン反映
+// （PatchZoneAtomicChanges）が**排他に影響しない**ことを固定する。
 //
-// 排他のラベルは SOA の「未反映の編集」としてのみ存在し、一括置き換えは未反映の編集を
-// 引き継がない。したがって overwrite_soa の値によらず排他は失われる。この性質は
-// utils.ZoneApplier の設計の根拠であり（specs/007-zone-atomic-apply/research.md D1）、
-// 変わった場合は気づけるようにしておく。
-func TestLockFlow_AtomicChangesLosesLock(t *testing.T) {
+// 置き換えの対象はレコードであり、排他の状態を持つゾーンのラベルは別のリソースである
+// （specs/009-zone-label-lock の前提）。したがって反映の後も排他は保持され、解放は通常
+// どおり成功する。**この前提が崩れると 009 の利用シナリオ 2 が成立しない**ため、崩れた
+// 場合に気づけるようにしておく。
+//
+// v0.5.0 までは排他の状態が SOA の未反映の編集としてのみ存在したため、この操作で排他が
+// 失われていた（specs/007-zone-atomic-apply/research.md D1）。本テストはその反転である。
+func TestLockFlow_AtomicChangesKeepsLock(t *testing.T) {
 	logSkipHint(t)
 	c := writeClient(t)
 	ctx := testContext(t)
@@ -228,7 +241,7 @@ func TestLockFlow_AtomicChangesLosesLock(t *testing.T) {
 	value := "dpf-go-ci-atomic-" + suffix
 	t.Logf("テスト用レコード: %s TXT %q", recordName, value)
 
-	mu := utils.NewMutex(api.RecordsAPI, zone.Id,
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id,
 		utils.WithOwner(ciLockOwner),
 		utils.WithTTL(5*time.Minute))
 
@@ -236,16 +249,20 @@ func TestLockFlow_AtomicChangesLosesLock(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()
 		defer cancel()
-		clearSOALock(t, cctx, c, zone.Id)
+		clearZoneLock(t, cctx, c, zone.Id)
 	})
 
-	logSOAState(t, ctx, c, zone.Id, "ロック前", ciLockOwner)
+	logLockState(t, ctx, c, zone.Id, "ロック前", ciLockOwner)
 
 	if err := mu.Lock(ctx); err != nil {
 		t.Fatalf("ロックを取得できない: %v", err)
 	}
-	if !logSOAState(t, ctx, c, zone.Id, "ロック後", ciLockOwner) {
-		t.Fatal("ロック後に SOA へロックのラベルが無い")
+	if !logLockState(t, ctx, c, zone.Id, "ロック後", ciLockOwner) {
+		t.Fatal("ロック後にゾーンへ排他のラベルが無い")
+	}
+	// 009: 排他はゾーンに未反映の編集を作らない。
+	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
+		t.Errorf("ロック後に未反映の編集が %d 件ある。排他はゾーン反映を伴わないこと", n)
 	}
 
 	// 反映済みレコードを全件取り、テスト用レコードを足して一括置き換えする。
@@ -270,26 +287,32 @@ func TestLockFlow_AtomicChangesLosesLock(t *testing.T) {
 	syncWaiter(t, c, "atomic_changes")(
 		api.ZonesAPI.PatchZoneAtomicChanges(ctx, zone.Id).PatchZoneAtomicChanges(body).Execute())
 
-	// ここが本題。ロックのラベルは失われていなければならない。
-	if held := logSOAState(t, ctx, c, zone.Id, "atomic_changes 後", ciLockOwner); held {
-		t.Error("一括置き換えの後も SOA にロックのラベルが残っている。" +
-			"specs/007-zone-atomic-apply/research.md D1 の前提（一括置き換えは排他を解く）が" +
-			"変わった可能性がある。ZoneApplier の設計を見直すこと")
+	// ここが本題。**排他は保持されたままでなければならない。**
+	// 置き換えの対象はレコードであり、排他の状態を持つゾーンのラベルは別のリソースで
+	// あるためである（009）。
+	if held := logLockState(t, ctx, c, zone.Id, "atomic_changes 後", ciLockOwner); !held {
+		t.Error("レコードの一括更新とゾーン反映の後に排他が失われている。" +
+			"specs/009-zone-label-lock の前提（一括置き換えはゾーンのラベルに影響しない）が" +
+			"崩れている。research.md D12 の判断が必要である")
 	}
 
 	// レコードの置き換えそのものは成功していること。
 	assertRecordState(t, ctx, c, zone.Id, recordName, dpf.RECORDSSTATE__0)
 
-	// 排他が実際に失われていることを、別 owner の取得で確かめる。
-	assertLockLost(t, ctx, c, zone.Id, "atomic_changes 後")
+	// 排他が実際に保持されていることを、別 owner の取得が拒否されることで確かめる。
+	assertStillLocked(t, ctx, c, zone.Id, "atomic_changes 後")
 
-	// 解放は「保持者でない」になる。これが ZoneApplier が無条件の解放を行わない理由である。
+	// 解放は通常どおり成功する。007 の「反映の後の解放が保持者でないになる」制約は
+	// 既定の排他には当てはまらなくなった。
 	err := mu.Unlock(ctx)
 	t.Logf("Unlock: err=%v", err)
-	if !errors.Is(err, utils.ErrNotLockHolder) {
-		t.Errorf("一括置き換えの後の解放が %v、期待は utils.ErrNotLockHolder", err)
+	if err != nil {
+		t.Errorf("一括置き換えの後の解放が失敗した: %v", err)
 	}
-	logSOAState(t, ctx, c, zone.Id, "Unlock 後", ciLockOwner)
+	// **ゾーンのラベルの更新は非同期であり、Unlock は確定を確認しない**（009
+	// contracts/zone-label.md 第 4 節）。復帰した直後は古い値が読めるため、確定を待つ。
+	waitZoneLockLabel(t, ctx, c, zone.Id, lockExpired, "排他の解放")
+	logLockState(t, ctx, c, zone.Id, "Unlock 後", ciLockOwner)
 }
 
 // TestLockFlow_ZoneChanges は「ロック取得 → レコード単位の変更 → PatchZoneChanges で
@@ -314,7 +337,7 @@ func TestLockFlow_ZoneChanges(t *testing.T) {
 	value := "dpf-go-ci-changes-" + suffix
 	t.Logf("テスト用レコード: %s TXT %q", recordName, value)
 
-	mu := utils.NewMutex(api.RecordsAPI, zone.Id,
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id,
 		utils.WithOwner(ciLockOwner),
 		utils.WithTTL(5*time.Minute))
 
@@ -322,15 +345,15 @@ func TestLockFlow_ZoneChanges(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()
 		defer cancel()
-		clearSOALock(t, cctx, c, zone.Id)
+		clearZoneLock(t, cctx, c, zone.Id)
 	})
 
-	logSOAState(t, ctx, c, zone.Id, "ロック前", ciLockOwner)
+	logLockState(t, ctx, c, zone.Id, "ロック前", ciLockOwner)
 
 	if err := mu.Lock(ctx); err != nil {
 		t.Fatalf("ロックを取得できない: %v", err)
 	}
-	if !logSOAState(t, ctx, c, zone.Id, "ロック後", ciLockOwner) {
+	if !logLockState(t, ctx, c, zone.Id, "ロック後", ciLockOwner) {
 		t.Fatal("ロック後に SOA へロックのラベルが無い")
 	}
 
@@ -346,15 +369,16 @@ func TestLockFlow_ZoneChanges(t *testing.T) {
 		api.RecordsAPI.PostRecord(ctx, zone.Id).PostRecord(post).Execute())
 	assertRecordState(t, ctx, c, zone.Id, recordName, dpf.RECORDSSTATE__1)
 
-	// 未反映は SOA のロックとテスト用レコードの 2 件である。
-	if n := pendingCount(t, ctx, c, zone.Id); n != 2 {
-		t.Fatalf("反映前の未反映件数が %d 件。SOA とレコードの 2 件であること", n)
+	// **未反映はテスト用レコードの 1 件だけである。** 009 以降、排他はゾーンのラベルを
+	// 使うため未反映の編集を作らない（v0.5.0 までは SOA の分と合わせて 2 件だった）。
+	if n := pendingCount(t, ctx, c, zone.Id); n != 1 {
+		t.Fatalf("反映前の未反映件数が %d 件。テスト用レコードの 1 件だけであること", n)
 	}
 
-	// ゾーン反映。SOA のロックの編集予定も一緒に反映される。
-	applyZone(t, ctx, c, zone.Id, 2, "dpf-go ci: changes "+suffix)
+	// ゾーン反映。排他はゾーンのラベルにあるため、この反映の対象に含まれない。
+	applyZone(t, ctx, c, zone.Id, 1, "dpf-go ci: changes "+suffix)
 
-	held := logSOAState(t, ctx, c, zone.Id, "PatchZoneChanges 後", ciLockOwner)
+	held := logLockState(t, ctx, c, zone.Id, "PatchZoneChanges 後", ciLockOwner)
 	if !held {
 		t.Error("PatchZoneChanges によって SOA のロックのラベルが失われた")
 	}
@@ -367,9 +391,11 @@ func TestLockFlow_ZoneChanges(t *testing.T) {
 	if err != nil {
 		t.Errorf("反映の後に解放できない: %v", err)
 	}
-	logSOAState(t, ctx, c, zone.Id, "Unlock 後", ciLockOwner)
+	// 解放の確定は非同期である（下の TestLockFlow_AtomicChangesKeepsLock と同じ）。
+	waitZoneLockLabel(t, ctx, c, zone.Id, lockExpired, "排他の解放")
+	logLockState(t, ctx, c, zone.Id, "Unlock 後", ciLockOwner)
 
-	other := utils.NewMutex(api.RecordsAPI, zone.Id,
+	other := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id,
 		utils.WithOwner("someone-else"), utils.WithTTL(2*time.Minute))
 	if err := other.Lock(ctx); err != nil {
 		t.Errorf("解放後に別 owner が取得できない: %v", err)
@@ -381,9 +407,9 @@ func TestLockFlow_ZoneChanges(t *testing.T) {
 // TestZoneApplierApply は utils.ZoneApplier でゾーン全体を安全に置き換えられることを
 // 確認する（specs/007-zone-atomic-apply の SC-003・SC-004・SC-007・SC-009）。
 //
-// 一括置き換えは排他を解くため、生の API を使う流れ
-// （TestLockFlow_AtomicChangesLosesLock）では反映の後の解放が失敗する。ZoneApplier は
-// そこまでを引き受けるため、成功した呼び出しが解放に起因して失敗しない。
+// 一括置き換えは排他に影響しない（TestLockFlow_AtomicChangesKeepsLock）。ZoneApplier は
+// 取り込みの可否を決めるフラグの固定と反映の完了待ちを引き受け、終了時に通常どおり
+// 解放する。
 //
 // SOA に利用者のラベルを付けた状態を作って実行し、そのラベルが残ることも確認する。
 func TestZoneApplierApply(t *testing.T) {
@@ -423,7 +449,7 @@ func TestZoneApplierApply(t *testing.T) {
 		api.RecordsAPI.PatchRecord(ctx, zone.Id, soa.Id).
 			PatchRecord(dpf.PatchRecord{Labels: &labels}).Execute())
 	applyZone(t, ctx, c, zone.Id, 1, "dpf-go ci: soa label "+suffix)
-	logSOAState(t, ctx, c, zone.Id, "ラベル反映後", ciLockOwner)
+	logLockState(t, ctx, c, zone.Id, "ラベル反映後", ciLockOwner)
 
 	// ZoneApplier でレコードを 1 件足す。
 	ap := utils.NewZoneApplier(api.RecordsAPI, api.ZonesAPI, api.JobsAPI, zone.Id,
@@ -457,15 +483,17 @@ func TestZoneApplierApply(t *testing.T) {
 	assertRecordState(t, ctx, c, zone.Id, recordName, dpf.RECORDSSTATE__0)
 
 	// 排他も未反映の編集も残らない（SC-005・SC-007）。
-	logSOAState(t, ctx, c, zone.Id, "Apply 後", ciLockOwner)
+	logLockState(t, ctx, c, zone.Id, "Apply 後", ciLockOwner)
 	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
 		t.Errorf("Apply の後に未反映の編集が %d 件残っている", n)
 	}
+	// 排他は解放されている。**解放の確定は非同期である**ため待つ（009
+	// contracts/zone-label.md 第 4 節。Unlock は確定を確認しない）。
+	waitZoneLockLabel(t, ctx, c, zone.Id, lockExpired, "Apply の後の排他の解放")
 	for _, r := range soaRecords(t, ctx, c, zone.Id) {
-		// 排他は保持されていない。過去の実行が残したラベルが反映済みとして
-		// 残っていることがあるため、キーの有無ではなく有効期限で判定する。
-		if r.Labels[utils.LockOwnerLabelKey] == ciLockOwner && !lockExpired(r.Labels) {
-			t.Errorf("Apply の後も排他が保持されている: %v", r.Labels)
+		// 排他はレコードのラベルを使わない（009 FR-001）。
+		if _, ok := r.Labels[utils.LockOwnerLabelKey]; ok {
+			t.Errorf("SOA に排他のラベルが付いている: %v", r.Labels)
 		}
 		// 利用者のラベルは残る（SC-009）。
 		if got := r.Labels[userLabelKey]; got != userLabelValue {
@@ -483,13 +511,11 @@ func TestZoneApplierApply(t *testing.T) {
 // TestZoneApplierSkipApply は、編集関数が utils.ErrSkipApply を返したときに反映が行われず、
 // 排他が解放されることを実 API で確認する（specs/007-zone-atomic-apply の FR-018b）。
 //
-// 反映した場合は一括置き換えが排他を解くため、Apply は無条件の解放を行わない。省略した
-// 場合はその経路を通らないため、**解放が通常どおり行われる**。実 API でそこまで通ることを
-// 見る。編集関数はレコードを 1 件足した一覧を番兵とともに返し、そのレコードが作られて
-// いないことで「一覧が使われていない」ことを確かめる。
+// 編集関数はレコードを 1 件足した一覧を番兵とともに返し、そのレコードが作られていないことで
+// 「一覧が使われていない」ことを確かめる。
 //
-// 省略は SOA の未反映の編集（排他のラベル）を残す。取得と解放がゾーン反映を伴わないため
-// であり、反映より前で失敗した場合と同じ状態である。後始末は resetPendingChanges で行う。
+// 009 以降、省略しても反映しても**ゾーンに未反映の編集は残らない**（排他はゾーンのラベルを
+// 使い、ゾーン反映を伴わない）。解放の後もラベルは残るが、奪ってよい時刻が過去になる。
 func TestZoneApplierSkipApply(t *testing.T) {
 	logSkipHint(t)
 	c := writeClient(t)
@@ -540,12 +566,13 @@ func TestZoneApplierSkipApply(t *testing.T) {
 		t.Errorf("省略したのにレコードが作られている: %v", got)
 	}
 
-	// 排他は解放されている。
-	logSOAState(t, ctx, c, zone.Id, "省略の後", ciLockOwner)
-	for _, r := range soaRecords(t, ctx, c, zone.Id) {
-		if r.Labels[utils.LockOwnerLabelKey] == ciLockOwner && !lockExpired(r.Labels) {
-			t.Errorf("省略の後も排他が保持されている: %v", r.Labels)
-		}
+	// 排他は解放されている（ラベルは残るが奪ってよい時刻が過去である）。
+	// **解放の確定は非同期である**ため待つ。
+	waitZoneLockLabel(t, ctx, c, zone.Id, lockExpired, "省略の後の排他の解放")
+	logLockState(t, ctx, c, zone.Id, "省略の後", ciLockOwner)
+	// 009: 省略でも反映でも、ゾーンに未反映の編集は残らない。
+	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
+		t.Errorf("省略の後に未反映の編集が %d 件残っている。排他はゾーン反映を伴わないこと", n)
 	}
 }
 
@@ -562,18 +589,18 @@ func TestZoneMutexDoRenews(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()
 		defer cancel()
-		clearSOALock(t, cctx, c, zone.Id)
+		clearZoneLock(t, cctx, c, zone.Id)
 	})
 
 	const ttl = time.Minute
-	mu := utils.NewMutex(c.GetAPIClient().RecordsAPI, zone.Id,
+	mu := utils.NewMutex(c.GetAPIClient().RecordsAPI, c.GetAPIClient().ZonesAPI, zone.Id,
 		utils.WithOwner(ciLockOwner),
 		utils.WithTTL(ttl),
 		utils.WithRenewInterval(20*time.Second))
 
 	var before, after int64
 	err := mu.Do(ctx, func(ctx context.Context) error {
-		before = soaLockDeadline(t, ctx, c, zone.Id)
+		before = zoneLockDeadline(t, ctx, c, zone.Id)
 		t.Logf("処理の開始時の奪ってよい時刻: %d（保持期間 %s）", before, ttl)
 
 		// 保持期間より長く待つ。延長が無ければこの時点で他者に奪える状態になる。
@@ -583,11 +610,11 @@ func TestZoneMutexDoRenews(t *testing.T) {
 		case <-time.After(ttl + 10*time.Second):
 		}
 
-		after = soaLockDeadline(t, ctx, c, zone.Id)
+		after = zoneLockDeadline(t, ctx, c, zone.Id)
 		t.Logf("処理の終了時の奪ってよい時刻: %d", after)
 
 		// まだ自分が保持している。
-		other := utils.NewMutex(c.GetAPIClient().RecordsAPI, zone.Id,
+		other := utils.NewMutex(c.GetAPIClient().RecordsAPI, c.GetAPIClient().ZonesAPI, zone.Id,
 			utils.WithOwner("someone-else"), utils.WithTTL(time.Minute))
 		if err := other.Lock(ctx); !errors.Is(err, utils.ErrStillLock) {
 			t.Errorf("保持期間より長い処理の途中で排他が失われた: 別 owner の取得が %v", err)
@@ -627,10 +654,10 @@ func TestZoneMutexDoPerRecord(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()
 		defer cancel()
-		clearSOALock(t, cctx, c, zone.Id)
+		clearZoneLock(t, cctx, c, zone.Id)
 	})
 
-	mu := utils.NewMutex(api.RecordsAPI, zone.Id,
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id,
 		utils.WithOwner(ciLockOwner), utils.WithTTL(5*time.Minute))
 
 	err := mu.Do(ctx, func(ctx context.Context) error {
@@ -644,8 +671,8 @@ func TestZoneMutexDoPerRecord(t *testing.T) {
 		syncWaiter(t, c, "レコード作成")(
 			api.RecordsAPI.PostRecord(ctx, zone.Id).PostRecord(post).Execute())
 
-		// 未反映は SOA の排他とテスト用レコードの 2 件。
-		applyZone(t, ctx, c, zone.Id, 2, "dpf-go ci: do "+suffix)
+		// 未反映はテスト用レコードの 1 件だけ（排他は未反映の編集を作らない）。
+		applyZone(t, ctx, c, zone.Id, 1, "dpf-go ci: do "+suffix)
 		return nil
 	})
 	if err != nil {
@@ -653,7 +680,7 @@ func TestZoneMutexDoPerRecord(t *testing.T) {
 	}
 
 	assertRecordState(t, ctx, c, zone.Id, recordName, dpf.RECORDSSTATE__0)
-	logSOAState(t, ctx, c, zone.Id, "Do 後", ciLockOwner)
+	logLockState(t, ctx, c, zone.Id, "Do 後", ciLockOwner)
 
 	// 解放されている（別 owner が取得できる）。
 	assertLockLost(t, ctx, c, zone.Id, "Do 後")
@@ -695,4 +722,114 @@ func removeSOALabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID, 
 		c.GetAPIClient().RecordsAPI.PatchRecord(ctx, zoneID, soa.Id).
 			PatchRecord(dpf.PatchRecord{Labels: &labels}).Execute())
 	applyZone(t, ctx, c, zoneID, pendingCount(t, ctx, c, zoneID), "dpf-go ci: cleanup soa label")
+}
+
+// TestZoneLabelLock_NoAuthoritativeEffect は、排他の取得・延長・解放が権威サーバへ
+// 公開されるデータに影響しないことを確認する（009 SC-002）。
+//
+// 公開されているレコードの一覧を排他の前後で比べる。ゾーンのラベルは管理属性であり、
+// DNS の応答には現れない。
+func TestZoneLabelLock_NoAuthoritativeEffect(t *testing.T) {
+	logSkipHint(t)
+	c := writeClient(t)
+	ctx := testContext(t)
+	api := c.GetAPIClient()
+	zone := writeZone(t, ctx, c)
+
+	resetPendingChanges(t, ctx, c, zone.Id)
+	t.Cleanup(func() {
+		cctx, cancel := cleanupContext()
+		defer cancel()
+		clearZoneLock(t, cctx, c, zone.Id)
+	})
+
+	names := func(phase string) []string {
+		recs := overwriteRecordsFromCurrents(t, ctx, c, zone.Id)
+		out := make([]string, 0, len(recs))
+		for _, r := range recs {
+			out = append(out, fmt.Sprintf("%s/%s", dns.CanonicalName(r.Name), r.Rrtype))
+		}
+		sort.Strings(out)
+		t.Logf("[%s] 公開されているレコード %d 件", phase, len(out))
+		return out
+	}
+
+	before := names("排他の前")
+
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, zone.Id,
+		utils.WithOwner(ciLockOwner), utils.WithTTL(5*time.Minute))
+	if err := mu.Lock(ctx); err != nil {
+		t.Fatalf("ロックを取得できない: %v", err)
+	}
+	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
+		t.Errorf("取得後に未反映の編集が %d 件ある。排他はゾーン反映を伴わないこと", n)
+	}
+	if err := mu.Renew(ctx); err != nil {
+		t.Fatalf("ロックを延長できない: %v", err)
+	}
+	if err := mu.Unlock(ctx); err != nil {
+		t.Fatalf("ロックを解放できない: %v", err)
+	}
+
+	after := names("排他の後")
+	if !slices.Equal(before, after) {
+		t.Errorf("公開されているレコードが変わっている\n前: %v\n後: %v", before, after)
+	}
+	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
+		t.Errorf("解放後に未反映の編集が %d 件残っている", n)
+	}
+}
+
+// TestZoneLabelLock_UnpublishedZone は、公開前のゾーンでもゾーンのラベルを読み書きできる
+// ことを確認する（009 research.md D12 の (2)）。
+//
+// `openapi.json` に記述が無いため実測で確かめる。**公開前のゾーンが見つからない場合は
+// スキップする。** その場合この項目は未確認のままであり、確認結果として報告してはならない。
+func TestZoneLabelLock_UnpublishedZone(t *testing.T) {
+	logSkipHint(t)
+	c := writeClient(t)
+	ctx := testContext(t)
+	api := c.GetAPIClient()
+
+	list, _, err := api.ZonesAPI.GetZoneList(ctx).ExecuteAll()
+	if err != nil {
+		t.Fatalf("ゾーンの一覧を取得できない: %v", err)
+	}
+	if list == nil {
+		t.Fatal("ゾーンの一覧の応答が空である")
+	}
+
+	var target *dpf.Zone
+	for i := range list.Results {
+		z := &list.Results[i]
+		if z.State != dpf.ZONESSTATE__2 {
+			target = z
+			break
+		}
+	}
+	if target == nil {
+		t.Skip("公開前のゾーンが見つからない。この項目は未確認のままである（009 research.md D12 の (2)）")
+	}
+	t.Logf("公開前のゾーン: %s (id=%s state=%d)", target.Name, target.Id, target.State)
+
+	// 読み取りができること。
+	labels := zoneLabelsOfZone(t, ctx, c, target.Id)
+	t.Logf("公開前のゾーンのラベル: %v", labels)
+
+	// 排他の取得と解放ができること。
+	mu := utils.NewMutex(api.RecordsAPI, api.ZonesAPI, target.Id,
+		utils.WithOwner(ciLockOwner), utils.WithTTL(2*time.Minute))
+	t.Cleanup(func() {
+		cctx, cancel := cleanupContext()
+		defer cancel()
+		clearZoneLock(t, cctx, c, target.Id)
+	})
+	if err := mu.Lock(ctx); err != nil {
+		t.Fatalf("公開前のゾーンで排他を取得できない: %v。"+
+			"読み書きできない場合は、公開前のゾーンを対象外として文書に明記すること", err)
+	}
+	if err := mu.Unlock(ctx); err != nil {
+		t.Errorf("公開前のゾーンで排他を解放できない: %v", err)
+	}
+	t.Log("公開前のゾーンでもラベルの読み書きができる")
 }

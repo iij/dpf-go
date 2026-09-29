@@ -14,16 +14,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	dpf "github.com/iij/dpf-go"
 	"github.com/miekg/dns"
 )
 
-// ロック情報を格納するレコードのラベルキー。
-// ラベルには JSON を保存できないため、owner と deadline を別々のキーに分けて保存する。
-// ゾーンの排他（SOA レコード）と一時レコード追加ロック（専用レコード）の双方で同じ
-// キーを用いる。いずれも「保持者」と「奪ってよい時刻」を表すが、対象はレコードごとに
-// 独立している。
+// ZoneLockLabelKey はゾーンの排他を格納する、ゾーンのラベルのキー。
+//
+// 値は「保持者」と「奪ってよい時刻」を 1 つに詰めた形である（形式は lockValue を参照）。
+// **ゾーンのラベルは未反映の編集の概念を持たない。** レコードのラベルと異なり、書き込みに
+// ゾーン反映を必要としない。排他が消費するゾーンのラベルはこの 1 つだけである。
+const ZoneLockLabelKey = "lock.dpf-go"
+
+// 一時レコード追加ロックの専用レコードに付けるラベルのキー。
+// レコードのラベルには JSON を保存できないため、owner と deadline を別々のキーへ分ける。
+// **ゾーンの排他はこれらを使わない**（ZoneLockLabelKey に 1 つへ詰める）。
 const (
 	// LockOwnerLabelKey はロック作成者(owner)を格納するラベルキー。
 	LockOwnerLabelKey = "owner.lock.dpf-go"
@@ -41,10 +47,19 @@ var (
 	// ErrNotLockHolder は、自分が保持していない排他に対して Renew または Unlock を
 	// 行った場合に返される。保持中に他者へ奪われた場合も含む。
 	ErrNotLockHolder = errors.New("dpf: not the lock holder")
-	// ErrLabelLimit は、SOA レコードのラベル数が上限に達しており、排他のための
-	// ラベルを追加できない場合に返される。排他はラベルを 2 つ使うため、利用者が
-	// SOA レコードへ自由に付けられるラベルは 8 個までである。
-	ErrLabelLimit = errors.New("dpf: soa record label limit reached")
+	// ErrLabelLimit は、ゾーンのラベル数が上限に達しており、排他のためのラベルを
+	// 追加できない場合に返される。排他はゾーンのラベルを 1 つ使うため、利用者が
+	// ゾーンへ自由に付けられるラベルは 9 個までである。
+	//
+	// 待っても解消しない状態であるため、取得を待つ指定があっても待たない。
+	ErrLabelLimit = errors.New("dpf: zone label limit reached")
+	// ErrOwnerTooLong は、保持者の文字数が上限を超えている場合に返される。
+	// 保持者は 1 文字以上 32 文字以下でなければならない。
+	//
+	// **黙って切り詰めることはしない。** 切り詰めると別のインスタンスと同じ保持者に
+	// なり、延長と解放の宛先の判別が壊れるためである。待っても解消しない状態であるため、
+	// 取得を待つ指定があっても待たない。
+	ErrOwnerTooLong = errors.New("dpf: lock owner too long")
 )
 
 const (
@@ -62,10 +77,25 @@ const (
 	// アンダースコアで始まる名前は通常のホスト名と衝突しない。
 	DefaultLockRecordLabel = "_dpf-go-lock"
 
-	// maxRecordLabels は 1 レコードに付けられるラベル数の上限（DPF-API の仕様）。
-	maxRecordLabels = 10
+	// maxZoneLabels は 1 ゾーンに付けられるラベル数の上限（DPF-API の仕様）。
+	maxZoneLabels = 10
 	// maxLabelValueLen はラベル値の最大長（DPF-API の仕様）。
 	maxLabelValueLen = 63
+	// maxOwnerLen は保持者の最大文字数。奪ってよい時刻（10 桁）と区切り（1 文字）を
+	// 足しても maxLabelValueLen に収まる範囲で定めている（32 + 1 + 10 = 43）。
+	maxOwnerLen = 32
+	// ownerHostLen は既定の保持者がホスト名へ割り当てる文字数。**固定である。**
+	// 接尾辞の実長で決めると PID の桁数によってホスト名の残り方が実行ごとに変わり、
+	// 同じホストなのに別の文字列に見える。診断で突き合わせにくいため固定する。
+	ownerHostLen = 15
+	// lockDeadlineDigits は値に詰める奪ってよい時刻の桁数。Unix 秒は 2286 年まで
+	// 10 桁である。10 桁に満たない場合は 0 で詰め、常にこの幅で書く。
+	lockDeadlineDigits = 10
+	// lockValueSep は保持者と奪ってよい時刻の区切り。
+	//
+	// 値は**右端から固定幅で読む**ため、保持者の側にこの文字が含まれていても曖昧に
+	// ならない。既定の保持者自身がこの文字を含むため、含めない制約は置けない。
+	lockValueSep = '-'
 	// renewIntervalDivisor は延長の間隔を保持期間から導く除数。
 	renewIntervalDivisor = 3
 	// defaultPollInterval は非同期処理の反映を待つ際のポーリング間隔。
@@ -104,76 +134,127 @@ func newOwner() string {
 		suffix += "-" + hex.EncodeToString(b[:])
 	}
 
-	if n := maxLabelValueLen - len(suffix); len(host) > n {
-		host = host[:n]
+	return truncateHost(host) + suffix
+}
+
+// truncateHost はホスト名を既定の保持者の枠（ownerHostLen）へ収める。
+//
+// **先頭を残して右側を落とす。** 枠を固定するのは、接尾辞の実長で決めると PID の桁数に
+// よってホスト名の残り方が実行ごとに変わり、同じホストなのに別の文字列に見えるためで
+// ある。
+func truncateHost(host string) string {
+	if len(host) > ownerHostLen {
+		return host[:ownerHostLen]
 	}
-	return host + suffix
+	return host
+}
+
+// lockValue は排他の状態を 1 つのラベルの値へ詰める。
+//
+//	<保持者><区切り><奪ってよい時刻の 10 桁>
+//	例: web01.tokyo-12345-a1b2c3d4-1790319252
+func lockValue(owner string, deadline time.Time) string {
+	return fmt.Sprintf("%s%c%0*d", owner, lockValueSep, lockDeadlineDigits, deadline.Unix())
+}
+
+// parseLockValue は lockValue が詰めた値を読み出す。
+//
+// **右端から固定幅で読む。** 末尾 lockDeadlineDigits 文字を奪ってよい時刻、その直前の
+// 1 文字を区切りとして確かめ、残りを保持者とする。左から区切りを探さないため、保持者に
+// 区切りと同じ文字が含まれていても曖昧にならない。
+//
+// 形式を満たさない場合は ok=false を返す。呼び出し側はこれを「排他が成立していない」と
+// して扱う。解釈できない値に引きずられて、ゾーンが永久に取得できない状態にしないためで
+// ある。
+func parseLockValue(v string) (owner string, deadline int64, ok bool) {
+	// 保持者 1 文字以上 + 区切り 1 文字 + 時刻 10 文字。
+	if len(v) < 1+1+lockDeadlineDigits {
+		return "", 0, false
+	}
+	sepAt := len(v) - lockDeadlineDigits - 1
+	if v[sepAt] != lockValueSep {
+		return "", 0, false
+	}
+	tail := v[sepAt+1:]
+	for i := 0; i < len(tail); i++ {
+		if tail[i] < '0' || tail[i] > '9' {
+			return "", 0, false
+		}
+	}
+	d, err := strconv.ParseInt(tail, 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+	return v[:sepAt], d, true
 }
 
 // Mutex はゾーン単位のロックを表す。
 //
-// ゾーンの SOA レコードのラベル（LockOwnerLabelKey / LockDeadlineLabelKey）に保持者と
-// 奪ってよい時刻を書き込み、SOA を編集予定の状態にすることでロックする。ラベルの
-// 読み取りから書き込みまでの区間は、専用レコードの追加（一時レコード追加ロック）で
-// 排他する。DPF-API はレコードの新規追加に対して同名かつ同 RRTYPE の重複を拒否し、
-// この拒否は編集者が誰かに依らないためである。
+// 対象ゾーンのラベル（ZoneLockLabelKey）に保持者と奪ってよい時刻を書き込むことで
+// ロックする。ラベルの読み取りから書き込みまでの区間は、専用レコードの追加（一時レコード
+// 追加ロック）で排他する。DPF-API はレコードの新規追加に対して同名かつ同 RRTYPE の重複を
+// 拒否し、この拒否は編集者が誰かに依らないためである。
 //
-// 排他の強さは競合相手によって異なる。
+// # 排他の効く相手
 //
-//   - 別ユーザ: DPF-API が編集中のレコードへの他ユーザからの編集を拒否するため、
-//     サーバ側で保証される。クライアントの協調に依存しない。
-//   - 同一ユーザの別プロセス: DPF-API は編集を拒否しない。一時レコード追加ロックの
-//     取得と解放によって成立する。
-//   - 同一プロセス内の別インスタンス: 重複の拒否は DPF-API 側で行われるため、
-//     同一ユーザの別プロセスと同じ仕組みで排他される。
+// **2 者が同時に取得することはない。** 一時レコード追加ロックの重複の拒否は DPF-API が
+// 行うため、**ユーザをまたいで機械的に効く。** 同一ユーザの別プロセス、同一プロセス内の
+// 別インスタンスも同じ仕組みで排他される。
 //
-// Mutex は Locker を満たす。ゾーン全体を一括で置き換える場合は排他が解かれるため、
-// その旨を申告している（ZoneApplier がこれを見て後始末を変える）。排他の仕組みを
-// 差し替えたい場合は Locker を実装し、ZoneApplier の WithLocker や RunLocked へ渡す。
+// **一方、保持中に他ユーザや管理画面からレコードを編集することは止められない。** 保持中の
+// 尊重は、奪ってよい時刻を読んで譲るという協調によって成り立つ。本ライブラリ（または同じ
+// ラベルを読む実装）を使わない相手には効かない。2 つの方式の比較はパッケージ文書を参照。
+//
+// # ゾーンに残るもの
+//
+// **排他はゾーンのラベルを 1 つ消費する。** ゾーンのラベル数の上限は 10 であるため、
+// 利用者がゾーンへ自由に付けられるラベルは 9 個までである。上限を超える場合、Lock は
+// 書き込みを試みずに ErrLabelLimit を返す。
+//
+// **解放してもラベルは残る。** Unlock は奪ってよい時刻を現在時刻へ更新するだけであり、
+// ラベルを削除しない（削除すると「一度も取得されていない」状態と区別が付かなくなる）。
+// したがって一度でも排他を取得したゾーンは、以降そのラベルを保持し続ける。
+//
+// **レコードのラベルは消費しない。** 利用者は SOA レコードのラベルを 10 個すべて使える。
+//
+// # ゾーン反映との関係
+//
+// Lock/Renew/Unlock はいずれもゾーン反映を行わず、**ゾーンに未反映の編集を作らない。**
+// ゾーンのラベルは未反映の編集の概念を持たないためである。取得・延長・解放は権威サーバへ
+// 公開されるデータにも影響しない。
+//
+// **レコードの一括更新とゾーン反映（PatchZoneAtomicChanges）は排他に影響しない。** 置き換え
+// の対象はレコードであり、ゾーンのラベルは別のリソースであるためである。反映の後も排他は
+// 保持され、通常どおり解放できる。ゾーン全体を一括で置き換える場合は、取り込みの可否を
+// 決めるフラグの固定と反映の完了待ちを引き受ける ZoneApplier を使うとよい。
+//
+// # 保持者
+//
+// **保持者は 1 文字以上 32 文字以下でなければならない。** 超える場合、Lock は書き込みを
+// 試みずに ErrOwnerTooLong を返す。**黙って切り詰めることはしない**（切り詰めると別の
+// インスタンスと同じ保持者になり、Renew と Unlock の宛先の判別が壊れる）。文字の種類に
+// 制約は無く、区切りと同じ文字を含んでいてもよい。
+//
+// WithOwner に一意でない値を渡しても排他は壊れない（排他は奪ってよい時刻によって
+// 成立する）。壊れるのは Renew と Unlock の宛先の判別だけである。
+//
+// # 旧版との混在
+//
+// **v0.5.0 以前は排他の状態を SOA レコードのラベルへ書いていた。** 新旧が同じゾーンを
+// 触ると、互いの排他を認識できず、両方が取得に成功しうる。ライブラリはこの混在を検出
+// できないため、**同じゾーンを触るプログラムはまとめて更新すること。**
+//
+// 旧版が SOA レコードへ残したラベルと未反映の編集は、本実装では掃除しない。必要であれば
+// 利用者の側で取り除く。
+//
+// # その他
 //
 // ロックは再入できない。保持中に Lock を呼ぶと ErrStillLock になるため、保持期間を
 // 延ばす場合は Renew を使う。1 つの Mutex は 1 つの保持者を表し、Renew と Unlock は
 // 自分が保持者であることを確認してから行う。
 //
-// WithOwner に一意でない値を渡しても排他は壊れない（排他は奪ってよい時刻によって
-// 成立する）。壊れるのは Renew と Unlock の宛先の判別だけである。
-//
-// Lock/Renew/Unlock はいずれもゾーン反映を行わない。Lock 後にレコードを編集し、
-// Lock した SOA ごとゾーン反映することを想定している。反映後に Unlock すると
-// レコードは編集可能な状態に戻り、再 Lock できる。
-//
-// 反映の方法によって注意点が異なる。
-//
-// PatchZoneChanges（編集中レコードのゾーン反映）は未反映の編集をすべて反映するため、
-// SOA に書いたロックの情報も一緒に反映される。ラベルは反映後も残るため、続けて
-// Unlock で解放できる。これが想定している使い方である。
-//
-// PatchZoneAtomicChanges（レコードの一括更新とゾーン反映）は、**ロックを保持したまま
-// 使えない。** ロックのラベルは SOA の「未反映の編集」としてのみ存在し、一括更新は未反映の
-// 編集を引き継がないためである。overwrite_soa の値は関係しない。この項目は「リクエストに
-// 入れた SOA を取り込むか」を決めるだけで、未反映の編集を復活させるものではない。
-//
-// GetRecordCurrents は反映済みの姿を返すため、そこから組み立てたリクエストにロックの
-// ラベルは含まれない。編集予定の SOA は「更新前の状態」(state=5) として返る。
-// GetRecordList が編集予定 (state=3) の行を返すのとは見え方が異なる。
-//
-// 反映の完了後は他者が排他を取得できる状態になり、Unlock は ErrNotLockHolder を返す。
-// **ゾーン全体を一括で置き換える場合は ZoneApplier を使うこと。** 取り込みの可否を決める
-// フラグを固定し、反映の前に自動延長を止め、反映の後は排他が残っていた場合に限り解放
-// するところまでを引き受ける。
-//
-// レコードを 1 つずつ変更してゾーンへ反映する流れでは、この制約は無い。反映によって
-// 排他は解かれず、ラベルは反映後も残る。Mutex.Do の中で反映まで行えばよい。
-//
-// ただしこの流れには注意がある。**ゾーン反映によってロックのラベルは「反映済み」に
-// なる。その後の Unlock は未反映の編集を作るため、これを破棄すると、反映済みの側に
-// 残った排他（奪ってよい時刻が未来）が復活する。** ゾーンの未反映の編集を一括で破棄する
-// 操作（DeleteZoneChanges など）を解放の後に行うと、保持期間が過ぎるまでゾーンが
-// ロックされたままになる。解放は破棄ではなく反映によって確定させること。
-//
-// 排他は SOA レコードのラベルを 2 つ使う。1 レコードのラベル数の上限は 10 であるため、
-// 利用者が SOA レコードへ自由に付けられるラベルは 8 個までである。上限を超える場合、
-// Lock は書き込みを試みずに ErrLabelLimit を返す。
+// Mutex は Locker を満たす。排他の仕組みを差し替えたい場合は Locker を実装し、
+// ZoneApplier の WithLocker や RunLocked へ渡す。
 //
 // 保持中に他者がゾーン反映を行うと、一時レコード追加ロックのための専用レコードが
 // 権威サーバへ公開されることがある。その場合、次の Lock がそのレコードを削除予定に
@@ -183,6 +264,7 @@ type Mutex struct {
 	mu sync.Mutex
 
 	cr               dpf.RecordsApi
+	cz               dpf.ZonesApi
 	zoneID           string
 	owner            string
 	ttl              time.Duration
@@ -301,6 +383,7 @@ func WithRenewInterval(d time.Duration) Option {
 
 // NewMutex はゾーン zoneID に対するロックを生成する。
 //   - cr     : レコード API（*dpf.RecordsAPIService が利用できる）
+//   - cz     : ゾーン API（*dpf.ZonesAPIService が利用できる）
 //   - zoneID : 対象ゾーンの ID
 //
 // 返された Mutex は 1 つの保持者を表す。同じインスタンスから並行して排他を取ることは
@@ -309,9 +392,10 @@ func WithRenewInterval(d time.Duration) Option {
 //
 // owner と ttl は基本的にデフォルト値（owner: インスタンスごとに一意な値 / ttl: 15分）
 // を使う。変更したい場合のみ Option を opts に渡す。
-func NewMutex(cr dpf.RecordsApi, zoneID string, opts ...Option) *Mutex {
+func NewMutex(cr dpf.RecordsApi, cz dpf.ZonesApi, zoneID string, opts ...Option) *Mutex {
 	m := &Mutex{
 		cr:               cr,
+		cz:               cz,
 		zoneID:           zoneID,
 		owner:            newOwner(),
 		ttl:              DefaultLockTTL,
@@ -343,15 +427,17 @@ func (t *Mutex) Owner() string {
 //
 // 手順は次の 4 段である。
 //
-//  1. SOA レコードのラベルによる事前判定。取得できないと分かった場合は、専用レコードを
+//  1. ゾーンのラベルによる事前判定。取得できないと分かった場合は、専用レコードを
 //     作らずに ErrStillLock（またはラベル数の上限による ErrLabelLimit）を返す。
 //  2. 一時レコード追加ロックの取得。
-//  3. SOA レコードの再読み取りと判定、ラベルの書き込み、書き込んだ内容の確認。
+//  3. ゾーンのラベルの再読み取りと判定、書き込み、書き込んだ内容の確認。
 //     事前判定の結果は用いない。判定と書き込みの間に他者が取得しうるためである。
 //  4. 一時レコード追加ロックの解放。第 3 段の成否によらず行う。
 //
+// 保持者が 32 文字を超える場合は、いずれの段にも入らず ErrOwnerTooLong を返す。
+//
 // 取得できるのは、奪ってよい時刻を過ぎている場合、ラベルが無い場合、ラベルの値が
-// 数値として解釈できない場合のみである。owner は判定に用いないため、自分自身が
+// 形式を満たさない場合のみである。owner は判定に用いないため、自分自身が
 // 保持している場合も ErrStillLock となる。保持期間を延ばす場合は Renew を使う。
 //
 // 復帰した時点で、書き込んだ内容が読み出せることを確認済みである。確認できない場合は
@@ -360,17 +446,26 @@ func (t *Mutex) Lock(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// 第 1 段: 事前判定。ゾーン名の取得も兼ねる。
-	soa, err := t.getSOA(ctx)
-	if err != nil {
-		return err
-	}
-	name := t.lockRecordName(soa)
-	if err := t.acquirable(soa.Labels); err != nil {
+	// 保持者の検証。書き込みを試みる前に返す。
+	if err := t.validateOwner(); err != nil {
 		return err
 	}
 
-	// 第 2 段: 一時レコード追加ロックの取得。
+	// 第 1 段: 事前判定。
+	labels, err := t.zoneLabels(ctx)
+	if err != nil {
+		return err
+	}
+	if err := t.acquirable(labels); err != nil {
+		return err
+	}
+
+	// 第 2 段: 一時レコード追加ロックの取得。ゾーン名はここで初めて必要になるため、
+	// 取得できないと分かった場合は SOA を読まずに戻る。
+	name, err := t.lockRecordName(ctx)
+	if err != nil {
+		return err
+	}
 	held, err := t.acquireLockRecord(ctx, name)
 	if err != nil {
 		return err
@@ -395,41 +490,51 @@ func (t *Mutex) Lock(ctx context.Context) error {
 	return nil
 }
 
-// lockGuarded は一時レコード追加ロックの保護下で、SOA レコードのラベルへ排他を
-// 書き込む。判定は事前判定の結果を使わず、ここで改めて行う。
+// lockGuarded は一時レコード追加ロックの保護下で、ゾーンのラベルへ排他を書き込む。
+// 判定は事前判定の結果を使わず、ここで改めて行う。
+//
+// 書き込みは読み取ったラベルをすべて含めて行う。ゾーンのラベルの更新はマップ全体の
+// 置き換えであり、排他のラベルだけを渡すと利用者のラベルが消えるためである。
 func (t *Mutex) lockGuarded(ctx context.Context) error {
-	soa, err := t.getSOA(ctx)
+	labels, err := t.zoneLabels(ctx)
 	if err != nil {
 		return err
 	}
-	if err := t.acquirable(soa.Labels); err != nil {
+	if err := t.acquirable(labels); err != nil {
 		return err
 	}
 
-	deadline := strconv.FormatInt(t.now().Add(t.ttl).Unix(), 10)
-	labels := cloneLabels(soa.Labels)
-	labels[LockOwnerLabelKey] = t.owner
-	labels[LockDeadlineLabelKey] = deadline
+	value := lockValue(t.owner, t.now().Add(t.ttl))
+	labels[ZoneLockLabelKey] = value
 
-	if err := t.patchLabels(ctx, soa.Id, labels); err != nil {
+	if err := t.putZoneLabels(ctx, labels); err != nil {
 		return err
 	}
-	return t.verify(ctx, deadline)
+	return t.verify(ctx, value)
 }
 
 // abandon は書き込んだ排他を最善努力で取り消す。エラーは無視する。
 // 「Lock がエラーを返したなら排他を保持していない」を保つための後始末である。
 func (t *Mutex) abandon(ctx context.Context) {
-	soa, err := t.getSOA(ctx)
+	labels, err := t.zoneLabels(ctx)
 	if err != nil {
 		return
 	}
-	if soa.Labels[LockOwnerLabelKey] != t.owner {
+	owner, _, ok := parseLockValue(labels[ZoneLockLabelKey])
+	if !ok || owner != t.owner {
 		return
 	}
-	labels := cloneLabels(soa.Labels)
-	labels[LockDeadlineLabelKey] = strconv.FormatInt(t.now().Unix(), 10)
-	_ = t.patchLabels(ctx, soa.Id, labels)
+	labels[ZoneLockLabelKey] = lockValue(t.owner, t.now())
+	_ = t.putZoneLabels(ctx, labels)
+}
+
+// validateOwner は保持者が値へ詰められる長さかを確かめる。
+// 文字数で数える（利用者が指定できる値であり、文字単位で示す方が扱いやすい）。
+func (t *Mutex) validateOwner() error {
+	if utf8.RuneCountInString(t.owner) > maxOwnerLen {
+		return ErrOwnerTooLong
+	}
+	return nil
 }
 
 // acquirable はラベルの状態から排他を取得できるかを判定する。
@@ -437,7 +542,7 @@ func (t *Mutex) abandon(ctx context.Context) {
 // ラベル数の上限を先に見る。上限は利用者が対処しなければ解消しない恒久的な状態で
 // あり、LockWait で待ち続けても取得できないためである。
 func (t *Mutex) acquirable(labels map[string]string) error {
-	if labelCountAfterLock(labels) > maxRecordLabels {
+	if labelCountAfterLock(labels) > maxZoneLabels {
 		return ErrLabelLimit
 	}
 	if !t.lockable(labels) {
@@ -446,14 +551,11 @@ func (t *Mutex) acquirable(labels map[string]string) error {
 	return nil
 }
 
-// labelCountAfterLock は排他のラベルを書き込んだ後のラベル数を返す。
-// 既にロックのラベルが付いている場合は置き換えになるため増えない。
+// labelCountAfterLock は排他のラベルを書き込んだ後のゾーンのラベル数を返す。
+// 既に排他のラベルが付いている場合は置き換えになるため増えない。
 func labelCountAfterLock(labels map[string]string) int {
 	n := len(labels)
-	if _, ok := labels[LockOwnerLabelKey]; !ok {
-		n++
-	}
-	if _, ok := labels[LockDeadlineLabelKey]; !ok {
+	if _, ok := labels[ZoneLockLabelKey]; !ok {
 		n++
 	}
 	return n
@@ -461,9 +563,9 @@ func labelCountAfterLock(labels map[string]string) int {
 
 // lockable は現在のラベルからロック取得可能かを判定する。
 // 次のいずれかを満たせばロック可能:
-//   - deadline ラベルが存在しない
-//   - deadline ラベルの値が数値として解釈できない（保持者不明として奪取を許す）
-//   - deadline ラベルが存在し、奪っても良い時刻を過ぎている
+//   - 排他のラベルが存在しない
+//   - 排他のラベルの値が形式を満たさない（保持者不明として奪取を許す）
+//   - 排他のラベルが存在し、奪っても良い時刻を過ぎている
 //
 // owner が自分自身かどうかは見ない。owner 一致で取得を許すと、同じ owner を持つ
 // 呼び出しがすべてロックを通り抜けてしまい、排他が成立しないためである。
@@ -471,15 +573,12 @@ func (t *Mutex) lockable(labels map[string]string) bool {
 	return t.expired(labels)
 }
 
-// expired は deadline ラベルが示す時刻を過ぎているかを返す。
-// ラベルが無い場合、および値を解釈できない場合も、保持者不明として過ぎたものとして扱う。
+// expired は排他のラベルが示す時刻を過ぎているかを返す。
+// ラベルが無い場合、および値の形式を満たさない場合も、保持者不明として過ぎたものと
+// して扱う。
 func (t *Mutex) expired(labels map[string]string) bool {
-	v, ok := labels[LockDeadlineLabelKey]
+	_, deadline, ok := parseLockValue(labels[ZoneLockLabelKey])
 	if !ok {
-		return true
-	}
-	deadline, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
 		return true
 	}
 	return t.now().Unix() >= deadline
@@ -487,18 +586,20 @@ func (t *Mutex) expired(labels map[string]string) bool {
 
 // verify は書き込んだ排他が実際に読み出せることを確認する。
 //
-// レコードの更新は非同期に処理されるため、書き込みの直後は反映されていない。加えて、
-// 同一ユーザからの同時更新は DPF-API に拒否されないため、自分が書いた値がそのまま
-// 残っているかどうかで競合に負けていないかを判定する。上限を過ぎても自分の値が
+// ゾーンのラベルの更新は非同期に処理されるため、書き込みの直後は反映されていない。
+// 加えて、同一ユーザからの同時更新は DPF-API に拒否されないため、自分が書いた値が
+// そのまま残っているかどうかで競合に負けていないかを判定する。上限を過ぎても自分の値が
 // 読み出せない場合は ErrStillLock を返す。
-func (t *Mutex) verify(ctx context.Context, deadline string) error {
+//
+// JOB の待ち合わせではなく読み戻しで確認するのは、「非同期の処理が終わったか」と
+// 「同時に書き込んだ他者に負けていないか」を同時に確かめられるためである。
+func (t *Mutex) verify(ctx context.Context, want string) error {
 	for waited := time.Duration(0); ; waited += t.pollInterval {
-		soa, err := t.getSOA(ctx)
+		labels, err := t.zoneLabels(ctx)
 		if err != nil {
 			return err
 		}
-		if soa.Labels[LockOwnerLabelKey] == t.owner &&
-			soa.Labels[LockDeadlineLabelKey] == deadline {
+		if labels[ZoneLockLabelKey] == want {
 			return nil
 		}
 		if waited >= t.verifyTimeout {
@@ -530,22 +631,22 @@ func (t *Mutex) Renew(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	soa, err := t.getSOA(ctx)
+	labels, err := t.zoneLabels(ctx)
 	if err != nil {
 		return err
 	}
-	if soa.Labels[LockOwnerLabelKey] != t.owner {
+	owner, _, ok := parseLockValue(labels[ZoneLockLabelKey])
+	if !ok || owner != t.owner {
 		return ErrNotLockHolder
 	}
 
-	deadline := strconv.FormatInt(t.now().Add(t.ttl).Unix(), 10)
-	labels := cloneLabels(soa.Labels)
-	labels[LockDeadlineLabelKey] = deadline
+	value := lockValue(t.owner, t.now().Add(t.ttl))
+	labels[ZoneLockLabelKey] = value
 
-	if err := t.patchLabels(ctx, soa.Id, labels); err != nil {
+	if err := t.putZoneLabels(ctx, labels); err != nil {
 		return err
 	}
-	if err := t.verify(ctx, deadline); err != nil {
+	if err := t.verify(ctx, value); err != nil {
 		if errors.Is(err, ErrStillLock) {
 			return ErrNotLockHolder
 		}
@@ -556,7 +657,17 @@ func (t *Mutex) Renew(ctx context.Context) error {
 
 // Unlock はロックを解放する。
 // ロックを奪っても良い時刻(deadline)を現在時刻に更新することで、他者が即座に
-// 奪取できるようにする。ロック(deadline ラベル)が存在しない場合は何もしない。
+// 奪取できるようにする。排他のラベルが存在しない場合は何もしない。
+//
+// **ラベルは削除しない。** 削除すると「一度も取得されていない」状態と区別が付かなく
+// なるためである。したがって一度でも排他を取得したゾーンは、解放の後もゾーンのラベルを
+// 1 つ保持し続ける。
+//
+// **解放の確定は非同期である。** ゾーンのラベルの更新は非同期に処理され、Unlock は
+// 書き込みの確定を確認しない（Lock と違い、待つ必要が無いためである）。したがって
+// **復帰した直後は、他者からまだ保持されているように見えることがある。** 解放を見届けて
+// から次の操作へ進みたい場合は、ラベルを読んで奪ってよい時刻が過去になったことを確かめる
+// こと。2026-09-29 に実 API で観測した。
 //
 // 自分が保持者でない場合は、他者の排他を変更せずに ErrNotLockHolder を返す。
 // defer から呼ぶ利用者が、保持中に奪われた事実を検知できるようにするためである。
@@ -564,22 +675,23 @@ func (t *Mutex) Unlock(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	soa, err := t.getSOA(ctx)
+	labels, err := t.zoneLabels(ctx)
 	if err != nil {
 		return err
 	}
 
-	if _, ok := soa.Labels[LockDeadlineLabelKey]; !ok {
+	v, exists := labels[ZoneLockLabelKey]
+	if !exists {
 		return nil
 	}
-	if soa.Labels[LockOwnerLabelKey] != t.owner {
+	owner, _, ok := parseLockValue(v)
+	if !ok || owner != t.owner {
 		return ErrNotLockHolder
 	}
 
-	labels := cloneLabels(soa.Labels)
-	labels[LockDeadlineLabelKey] = strconv.FormatInt(t.now().Unix(), 10)
+	labels[ZoneLockLabelKey] = lockValue(t.owner, t.now())
 
-	return t.patchLabels(ctx, soa.Id, labels)
+	return t.putZoneLabels(ctx, labels)
 }
 
 // LockWait はロックを取得できるまで Lock をリトライし続ける。
@@ -621,19 +733,36 @@ func (t *Mutex) RenewInterval() time.Duration {
 	return t.renewInterval
 }
 
-// consumedByZoneApply は、ゾーン全体の一括置き換えがこの排他を解くことを申告する。
+// zoneLabels はゾーンのラベルを読み、複製を返す。
 //
-// 排他のラベルは SOA の「未反映の編集」としてのみ存在し、一括置き換えは未反映の編集を
-// 引き継がない。2026-09-24 に実 API で確認した（specs/007-zone-atomic-apply）。
-func (t *Mutex) consumedByZoneApply() bool { return true }
+// 複製を返すのは、呼び出し側が排他のラベルを足して書き戻すためである。ゾーンのラベルの
+// 更新はマップ全体の置き換えであり、**読み取ったラベルをすべて含めて書き戻さなければ
+// 利用者のラベルが消える。**
+func (t *Mutex) zoneLabels(ctx context.Context) (map[string]string, error) {
+	res, _, err := t.cz.GetZoneLabels(ctx, t.zoneID).Execute()
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, ErrZoneNotFound
+	}
+	return cloneLabels(res.Result.Labels), nil
+}
 
-// getSOA は排他の判定に用いる SOA レコードを返す。// getSOA は排他の判定に用いる SOA レコードを返す。
+// putZoneLabels はゾーンのラベルを更新する。
+// 更新は非同期に処理されるため、確定の確認は verify で行う。
+func (t *Mutex) putZoneLabels(ctx context.Context, labels map[string]string) error {
+	_, _, err := t.cz.PutZoneLabels(ctx, t.zoneID).
+		ZoneLabels(dpf.ZoneLabels{Labels: labels}).Execute()
+	return err
+}
+
+// getSOA はゾーン名を得るための SOA レコードを返す。
 //
-// 編集予定(state=3)の行があればそれを、無ければ反映済み(state=0)の行を返す。
-// 排他を保持している間の SOA は編集予定であり、反映済みの行には排他のラベルが
-// 付いていないためである。反映済みを優先すると、保持中の排他を他者へ渡してしまう。
-// どちらも見つからない場合、および同じ state の行が複数ある場合は、判定材料が
-// 一意に決まらないためエラーを返す。
+// **排他の判定には用いない。** 排他の状態はゾーンのラベルにあり、SOA を読む理由は
+// 専用レコードの名前に必要なゾーン名だけである。SOA はゾーンの apex に 1 つだけ存在し、
+// 編集予定と反映済みの行が並存していても名前は同じであるため、最初に見つかった行を
+// 返す。見つからない場合は ErrRecordNotFound を返す。
 func (t *Mutex) getSOA(ctx context.Context) (*dpf.Record, error) {
 	records, _, err := t.cr.GetRecordList(ctx, t.zoneID).
 		KeywordsRrtype(dpf.RECORDSRRTYPE_SOA).
@@ -645,40 +774,13 @@ func (t *Mutex) getSOA(ctx context.Context) (*dpf.Record, error) {
 		return nil, ErrRecordNotFound
 	}
 
-	var editing, applied []*dpf.Record
 	for i := range records.Results {
 		r := &records.Results[i]
-		if r.Rrtype != dpf.RECORDSRRTYPE_SOA {
-			continue
-		}
-		switch r.State {
-		case dpf.RECORDSSTATE__3:
-			editing = append(editing, r)
-		case dpf.RECORDSSTATE__0:
-			applied = append(applied, r)
-		}
-	}
-
-	for _, candidates := range [][]*dpf.Record{editing, applied} {
-		switch len(candidates) {
-		case 0:
-			continue
-		case 1:
-			return candidates[0], nil
-		default:
-			return nil, fmt.Errorf("dpf: SOA レコードが state=%d で %d 件見つかった。排他の判定材料が一意に決まらない",
-				candidates[0].State, len(candidates))
+		if r.Rrtype == dpf.RECORDSRRTYPE_SOA {
+			return r, nil
 		}
 	}
 	return nil, ErrRecordNotFound
-}
-
-// patchLabels はレコードのラベルを更新し、編集予定状態にする。
-// 更新は非同期に処理されるため、反映の確認は verify で行う。
-func (t *Mutex) patchLabels(ctx context.Context, recordID string, labels map[string]string) error {
-	body := dpf.PatchRecord{Labels: &labels}
-	_, _, err := t.cr.PatchRecord(ctx, t.zoneID, recordID).PatchRecord(body).Execute()
-	return err
 }
 
 // lockRecordName は専用レコードの FQDN を返す。
@@ -686,11 +788,18 @@ func (t *Mutex) patchLabels(ctx context.Context, recordID string, labels map[str
 // ゾーン名は SOA レコードの name から導く。SOA レコードはゾーンの apex に 1 つだけ
 // 存在するため、その名前はゾーン名そのものである。結合と正規化は miekg/dns で行い、
 // 最左ラベルのみを受け取るためゾーンの範囲外にはならない。
-func (t *Mutex) lockRecordName(soa *dpf.Record) string {
+//
+// **一度得たゾーン名は保持し、2 回目以降は SOA を読まない。** ゾーン名は zoneID に
+// 対して不変である。
+func (t *Mutex) lockRecordName(ctx context.Context) (string, error) {
 	if t.zoneName == "" {
+		soa, err := t.getSOA(ctx)
+		if err != nil {
+			return "", err
+		}
 		t.zoneName = dns.Fqdn(soa.Name)
 	}
-	return t.lockRecordLabel + "." + t.zoneName
+	return t.lockRecordLabel + "." + t.zoneName, nil
 }
 
 // acquireLockRecord は一時レコード追加ロックを取得し、自分が作った専用レコードの

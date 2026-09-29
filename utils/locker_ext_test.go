@@ -227,15 +227,18 @@ func TestZoneApplier_WithReplacedLocker(t *testing.T) {
 		t.Errorf("取り込みのフラグが soa=%v apexNS=%v。いずれも false であること", soa, apexNS)
 	}
 
-	// レコードを用いる排他ではないため、SOA は触られていない。
+	// 差し替えた排他は DPF-API を一切使わない。レコードもゾーンのラベルも触られない。
 	if n := env.Patches(); n != 0 {
-		t.Errorf("SOA への更新が %d 回。差し替えた排他ではレコードを触らないこと", n)
+		t.Errorf("レコードへの更新が %d 回。差し替えた排他ではレコードを触らないこと", n)
 	}
 	if labels := env.SOALabels(); len(labels) != 0 {
 		t.Errorf("SOA に排他のラベルが付いている: %v", labels)
 	}
+	if labels := env.ZoneLabels(); len(labels) != 0 {
+		t.Errorf("ゾーンに排他のラベルが付いている: %v。差し替えた排他は使わないこと", labels)
+	}
 
-	// **反映が排他を解かない実装でも、解放は正しく行われる。**
+	// **反映の後も排他は保持されており、解放は正しく行われる。**
 	if err := other.Lock(t.Context()); err != nil {
 		t.Fatalf("反映の後に排他が解放されていない: %v", err)
 	}

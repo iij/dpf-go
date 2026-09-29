@@ -55,7 +55,7 @@ func ExampleNewMutex() {
 	client := dpf.NewAPIClient(cfg)
 	ctx := context.Background()
 
-	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+	mu := utils.NewMutex(client.RecordsAPI, client.ZonesAPI, "zone-id-123456")
 	if err := mu.Lock(ctx); err != nil {
 		// ErrStillLock の場合は他者がロック中。
 		return
@@ -78,7 +78,7 @@ func ExampleMutex_Renew() {
 	client := dpf.NewAPIClient(cfg)
 	ctx := context.Background()
 
-	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+	mu := utils.NewMutex(client.RecordsAPI, client.ZonesAPI, "zone-id-123456")
 	if err := mu.Lock(ctx); err != nil {
 		return
 	}
@@ -106,7 +106,7 @@ func ExampleMutex_Do() {
 	client := dpf.NewAPIClient(cfg)
 	ctx := context.Background()
 
-	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+	mu := utils.NewMutex(client.RecordsAPI, client.ZonesAPI, "zone-id-123456")
 
 	err := mu.Do(ctx, func(ctx context.Context) error {
 		// ここでレコードを 1 つずつ変更し、ゾーンへ反映する。
@@ -204,6 +204,7 @@ func ExampleNewMutex_options() {
 
 	mu := utils.NewMutex(
 		client.RecordsAPI,
+		client.ZonesAPI,
 		"zone-id-123456",
 		utils.WithOwner("deployer"),
 		utils.WithTTL(30*time.Minute),
@@ -216,7 +217,7 @@ func ExampleMutex_LockWait() {
 	cfg := dpf.NewConfiguration()
 	client := dpf.NewAPIClient(cfg)
 
-	mu := utils.NewMutex(client.RecordsAPI, "zone-id-123456")
+	mu := utils.NewMutex(client.RecordsAPI, client.ZonesAPI, "zone-id-123456")
 	ctx := context.Background()
 	if err := mu.LockWait(ctx, 5*time.Second); err != nil {
 		return
