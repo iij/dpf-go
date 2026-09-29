@@ -7,7 +7,6 @@ package integration
 import (
 	"context"
 	"errors"
-	"strconv"
 	"testing"
 	"time"
 
@@ -23,7 +22,7 @@ import (
 // 以前は「owner が自分自身ならロック可能」という判定で中断からの自己回復を得ていたが、
 // specs/006-zone-lock-redesign によりその判定は無くなった（同一 owner を持つ
 // プログラム同士が互いを排他できなくなるため）。中断からの回復は t.Cleanup の
-// discardSOAChanges、ロックの TTL の経過、一時レコード追加ロックの失効が担う。
+// clearZoneLock、ロックの TTL の経過、一時レコード追加ロックの失効が担う。
 const ciLockOwner = "dpf-go-ci"
 
 // soaRecord はゾーンの SOA レコードをすべて返す（state 込み）。
@@ -47,56 +46,47 @@ func soaRecords(t *testing.T, ctx context.Context, c *utils.Client, zoneID strin
 	return out
 }
 
-// waitSOALabel は SOA のラベルが条件を満たすまで待つ。
+// waitZoneLockLabel はゾーンのラベルの排他が条件を満たすまで待つ。
 //
 // utils.Mutex は内部の PatchRecord の AsyncResponse を破棄しており SyncWait できない。
 // Lock と Renew は書き込んだ内容が読み出せることを自分で確認してから復帰するため
 // 待機は不要だが、Unlock は確認しない。「非同期 JOB を重ねない」制約を守るため、
 // ラベルが実際に反映されるまでここで待つ。
-func waitSOALabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID string, cond func(map[string]string) bool, what string) {
+// waitZoneLockLabel は、ゾーンのラベルの排他が条件を満たすまで待つ。
+// ゾーンのラベルの更新は非同期であるため、書き込みの直後は読めないことがある。
+func waitZoneLockLabel(t *testing.T, ctx context.Context, c *utils.Client, zoneID string, cond func(string) bool, what string) {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Minute)
 	for {
-		for _, r := range soaRecords(t, ctx, c, zoneID) {
-			if cond(r.Labels) {
-				return
-			}
+		v := zoneLockLabel(t, ctx, c, zoneID)
+		if cond(v) {
+			return
 		}
 		if time.Now().After(deadline) {
-			for _, r := range soaRecords(t, ctx, c, zoneID) {
-				t.Logf("SOA: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
-			}
+			t.Logf("ゾーンのラベル: %v", zoneLabelsOfZone(t, ctx, c, zoneID))
 			t.Fatalf("%s が反映されなかった", what)
 		}
 		time.Sleep(3 * time.Second)
 	}
 }
 
-// soaLockDeadline は SOA レコードのロックの奪ってよい時刻を返す。
-func soaLockDeadline(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) int64 {
+// zoneLockDeadline はゾーンのラベルの排他の奪ってよい時刻を返す。
+func zoneLockDeadline(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) int64 {
 	t.Helper()
 
-	for _, r := range soaRecords(t, ctx, c, zoneID) {
-		v, ok := r.Labels[utils.LockDeadlineLabelKey]
-		if !ok {
-			continue
-		}
-		d, err := strconv.ParseInt(v, 10, 64)
-		if err != nil {
-			t.Fatalf("奪ってよい時刻 %q を解釈できない: %v", v, err)
-		}
-		return d
+	v := zoneLockLabel(t, ctx, c, zoneID)
+	_, d, ok := parseZoneLock(v)
+	if !ok {
+		t.Fatalf("ゾーンのラベルに排他が無い、または形式を満たさない: %q", v)
 	}
-	t.Fatal("SOA レコードにロックのラベルが無い")
-	return 0
+	return d
 }
 
 // TestZoneMutex はゾーン単位ロックの取得・競合・延長・解放を検証する。
 //
-// ロックは SOA レコードの「編集予定」状態を利用しているため、反映して
-// しまうとロックとして機能しなくなる。このテストはゾーン反映を行わず、
-// 最後に SOA の未反映編集ごと破棄して元の状態に戻す。
+// 009 以降、排他の状態はゾーンのラベルにあり、**ゾーンに未反映の編集を作らない。**
+// 最後にゾーンのラベルから排他を取り除いて元の状態に戻す（ゾーン反映は不要である）。
 func TestZoneMutex(t *testing.T) {
 	c := writeClient(t)
 	ctx := testContext(t)
@@ -104,36 +94,40 @@ func TestZoneMutex(t *testing.T) {
 
 	resetPendingChanges(t, ctx, c, zone.Id)
 
-	// GetRecordList が返す SOA の行を記録に残す。2026-09-18 の実測では、ロック前は
-	// state=0 の 1 行、ロック後は同じ ID の state=3 の 1 行のみで、state=5（更新前の
-	// 状態）の行は現れなかった。utils/lock.go の getSOA は state=3 を優先し、一意に
-	// 決まらない場合はエラーとするため、応答が変わっても古い行を掴むことはない。
-	// 応答が変わった場合はこのログで気づける。
+	// SOA の行を記録に残す。009 以降、排他は SOA を触らないため、ロックの前後で
+	// state もラベルも変わらないはずである。変わった場合はこのログで気づける。
 	for _, r := range soaRecords(t, ctx, c, zone.Id) {
 		t.Logf("ロック前の SOA: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
 	}
 
 	recordsAPI := c.GetAPIClient().RecordsAPI
-	mu := utils.NewMutex(recordsAPI, zone.Id,
+	zonesAPI := c.GetAPIClient().ZonesAPI
+	mu := utils.NewMutex(recordsAPI, zonesAPI, zone.Id,
 		utils.WithOwner(ciLockOwner),
 		utils.WithTTL(2*time.Minute))
 
-	// 後始末: SOA の未反映編集を必ず破棄する。
+	// 後始末: ゾーンのラベルから排他を必ず取り除く。
 	t.Cleanup(func() {
 		cctx, cancel := cleanupContext()
 		defer cancel()
-		discardSOAChanges(t, cctx, c, zone.Id)
+		clearZoneLock(t, cctx, c, zone.Id)
 	})
 
 	if err := mu.Lock(ctx); err != nil {
 		t.Fatalf("ロックを取得できない: %v", err)
 	}
-	waitSOALabel(t, ctx, c, zone.Id, func(l map[string]string) bool {
-		return l[utils.LockOwnerLabelKey] == ciLockOwner && l[utils.LockDeadlineLabelKey] != ""
-	}, "ロックのラベル")
+	waitZoneLockLabel(t, ctx, c, zone.Id, func(v string) bool {
+		owner, _, ok := parseZoneLock(v)
+		return ok && owner == ciLockOwner
+	}, "排他のラベル")
+	t.Logf("ロック後のゾーンのラベル: %v", zoneLabelsOfZone(t, ctx, c, zone.Id))
 
+	// **排他は SOA を触らない。** ロックの前後で state もラベルも変わらない。
 	for _, r := range soaRecords(t, ctx, c, zone.Id) {
 		t.Logf("ロック後の SOA: id=%s state=%d labels=%v", r.Id, r.State, r.Labels)
+		if _, ok := r.Labels[utils.LockOwnerLabelKey]; ok {
+			t.Errorf("SOA に排他のラベルが付いている: %v", r.Labels)
+		}
 	}
 
 	// 一時レコード追加ロックの専用レコードは、排他が取得できた時点で取り消される。
@@ -144,12 +138,13 @@ func TestZoneMutex(t *testing.T) {
 		}
 		t.Errorf("取得後に専用レコード %s が %d 件残っている", lockRecordName(), len(recs))
 	}
-	if n := pendingCount(t, ctx, c, zone.Id); n != 1 {
-		t.Errorf("取得後の未反映件数が %d 件。SOA の 1 件だけであること", n)
+	// 009: 排他はゾーンに未反映の編集を作らない。
+	if n := pendingCount(t, ctx, c, zone.Id); n != 0 {
+		t.Errorf("取得後の未反映件数が %d 件。排他はゾーン反映を伴わないこと", n)
 	}
 
 	// 別の owner はロックを奪えない。
-	other := utils.NewMutex(recordsAPI, zone.Id,
+	other := utils.NewMutex(recordsAPI, zonesAPI, zone.Id,
 		utils.WithOwner("someone-else"),
 		utils.WithTTL(2*time.Minute))
 	if err := other.Lock(ctx); !errors.Is(err, utils.ErrStillLock) {
@@ -162,13 +157,13 @@ func TestZoneMutex(t *testing.T) {
 	}
 
 	// 保持期間の延長は Renew で行う（FR-022）。
-	before := soaLockDeadline(t, ctx, c, zone.Id)
+	before := zoneLockDeadline(t, ctx, c, zone.Id)
 	if err := mu.Renew(ctx); err != nil {
 		t.Fatalf("ロックを延長できない: %v", err)
 	}
-	waitSOALabel(t, ctx, c, zone.Id, func(l map[string]string) bool {
-		d, err := strconv.ParseInt(l[utils.LockDeadlineLabelKey], 10, 64)
-		return err == nil && d > before
+	waitZoneLockLabel(t, ctx, c, zone.Id, func(v string) bool {
+		_, d, ok := parseZoneLock(v)
+		return ok && d > before
 	}, "ロック延長のラベル")
 	t.Logf("ロックを延長した: 奪ってよい時刻が %d より後になった", before)
 
@@ -183,14 +178,14 @@ func TestZoneMutex(t *testing.T) {
 	if err := mu.Unlock(ctx); err != nil {
 		t.Fatalf("ロックを解放できない: %v", err)
 	}
-	waitSOALabel(t, ctx, c, zone.Id, func(l map[string]string) bool {
-		v, ok := l[utils.LockDeadlineLabelKey]
-		if !ok {
-			return false
-		}
-		deadline, err := strconv.ParseInt(v, 10, 64)
-		return err == nil && deadline <= time.Now().Unix()
+	waitZoneLockLabel(t, ctx, c, zone.Id, func(v string) bool {
+		_, d, ok := parseZoneLock(v)
+		return ok && d <= time.Now().Unix()
 	}, "ロック解放のラベル")
+	// 解放してもラベルは残る（009 FR-002b）。
+	if v := zoneLockLabel(t, ctx, c, zone.Id); v == "" {
+		t.Error("解放でラベルが削除されている。削除してはならない")
+	}
 
 	// 解放後は別 owner でも取得できる。
 	if err := other.Lock(ctx); err != nil {
@@ -198,25 +193,5 @@ func TestZoneMutex(t *testing.T) {
 	}
 	if err := other.Unlock(ctx); err != nil {
 		t.Fatalf("別 owner のロックを解放できない: %v", err)
-	}
-}
-
-// discardSOAChanges は SOA レコードの未反映編集を破棄する。
-// ゾーン全体の DeleteZoneChanges ではなく、対象を絞って取り消す。
-func discardSOAChanges(t *testing.T, ctx context.Context, c *utils.Client, zoneID string) {
-	t.Helper()
-
-	for _, r := range soaRecords(t, ctx, c, zoneID) {
-		if r.State == dpf.RECORDSSTATE__0 {
-			continue // 反映済みの行には未反映の編集が無い。
-		}
-		t.Logf("SOA (id=%s state=%d) の未反映編集を破棄する", r.Id, r.State)
-		syncWaiter(t, c, "SOA 編集の破棄")(
-			c.GetAPIClient().RecordsAPI.DeleteRecordChanges(ctx, zoneID, r.Id).Execute())
-		break
-	}
-
-	if n := pendingCount(t, ctx, c, zoneID); n != 0 {
-		t.Errorf("後始末後も未反映の編集が %d 件残っている", n)
 	}
 }

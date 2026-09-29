@@ -75,12 +75,14 @@ func TestMutexDo_SameAsRunLocked(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Mutex.Do
-			s1 := newLockServer(cloneLabels(tc.labels), 0)
+			s1 := newLockServer(nil, 0)
+			setZoneLabels(s1, tc.labels)
 			m1 := doMutex(newLockClient(t, s1), "alice", now)
 			errDo := m1.Do(context.Background(), tc.fn)
 
 			// RunLocked（同じ排他を渡す）
-			s2 := newLockServer(cloneLabels(tc.labels), 0)
+			s2 := newLockServer(nil, 0)
+			setZoneLabels(s2, tc.labels)
 			m2 := doMutex(newLockClient(t, s2), "alice", now)
 			errRun := RunLocked(context.Background(), m2, tc.fn)
 
@@ -91,8 +93,8 @@ func TestMutexDo_SameAsRunLocked(t *testing.T) {
 				t.Errorf("RunLocked のエラーが %v、期待は %v", errRun, tc.want)
 			}
 			// 排他の痕跡も同じであること。
-			if got, want := s1.find(testSOAID).labels, s2.find(testSOAID).labels; !sameLabels(got, want) {
-				t.Errorf("SOA のラベルが Do=%v、RunLocked=%v で異なる", got, want)
+			if got, want := zoneLabelsOf(s1), zoneLabelsOf(s2); !sameLabels(got, want) {
+				t.Errorf("ゾーンのラベルが Do=%v、RunLocked=%v で異なる", got, want)
 			}
 		})
 	}
@@ -101,7 +103,7 @@ func TestMutexDo_SameAsRunLocked(t *testing.T) {
 // Mutex.Do は HoldOption をそのまま RunLocked へ渡す。
 func TestMutexDo_PassesHoldOptions(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Add(time.Hour).Unix()), 0)
+	s := lockedServer("bob", now.Add(time.Hour).Unix())
 	m := doMutex(newLockClient(t, s), "alice", now)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -169,7 +171,7 @@ func TestMutex_DeclaresRenewInterval(t *testing.T) {
 	s := newLockServer(map[string]string{}, 0)
 	c := newLockClient(t, s)
 
-	m := NewMutex(c.RecordsAPI, testZoneID, WithTTL(30*time.Minute))
+	m := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, WithTTL(30*time.Minute))
 	if got := renewIntervalOf(m, 0); got != 10*time.Minute {
 		t.Errorf("延長の間隔が %v、期待は保持期間の 1/3（10m）", got)
 	}
@@ -185,8 +187,10 @@ func TestConsumesLockOnZoneApply(t *testing.T) {
 	s := newLockServer(map[string]string{}, 0)
 	c := newLockClient(t, s)
 
-	if !consumesLockOnZoneApply(NewMutex(c.RecordsAPI, testZoneID)) {
-		t.Error("レコードを用いる排他が「一括置き換えで解かれる」と申告していない")
+	// 009 以降、排他の状態はゾーンのラベルにあり、レコードの一括更新とゾーン反映は
+	// これに影響しない。したがって既定の排他は「解かれる」と申告しない。
+	if consumesLockOnZoneApply(NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)) {
+		t.Error("既定の排他が「一括置き換えで解かれる」と申告している。ゾーンのラベルは一括置き換えの対象ではない")
 	}
 	// 外部の仕組みを使う排他は申告できない（非公開のメソッドであるため）。
 	if consumesLockOnZoneApply(&fakeLocker{}) {

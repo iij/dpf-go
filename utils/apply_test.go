@@ -5,6 +5,7 @@ package utils
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -220,14 +221,187 @@ func TestZoneApplier_NoRecords(t *testing.T) {
 	}
 	// 排他は解放されている。
 	want := timeString(now)
-	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("排他が解放されていない: deadline=%q, want %q", got, want)
+	}
+}
+
+// ---- 反映の省略 (FR-018b) ----
+
+// skipAll は反映しないことを表す番兵を返す編集関数。
+func skipAll(_ context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+	return nil, ErrSkipApply
+}
+
+func TestZoneApplier_SkipApply(t *testing.T) {
+	tests := []struct {
+		name string
+		edit ZoneRecordsEditor
+	}{
+		{"番兵だけを返す", skipAll},
+		{
+			"一覧とともに返しても一覧は使われない",
+			func(_ context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+				return records, ErrSkipApply
+			},
+		},
+		{
+			"包んで返しても省略される",
+			func(_ context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+				return nil, fmt.Errorf("台帳に変更が無い: %w", ErrSkipApply)
+			},
+		},
+		{
+			// 束ねて返すと省略が優先され、もう一方は失われる。godoc で禁じている
+			// 使い方だが、判定の結果そのものは固定しておく。
+			"束ねて返すと省略が優先される",
+			func(_ context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+				return nil, errors.Join(ErrSkipApply, errors.New("失われるエラー"))
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			now := fixedNow()
+			s := applyServer(map[string]string{})
+			c := newLockClient(t, s)
+			a := testApplier(c, "alice", now)
+
+			if err := a.Apply(context.Background(), tc.edit); err != nil {
+				t.Fatalf("省略は成功として返ること: %v", err)
+			}
+			if s.atomics != 0 {
+				t.Errorf("省略したのに一括置き換えを呼んだ（%d 回）", s.atomics)
+			}
+			if s.applies != 0 {
+				t.Errorf("省略したのにゾーン反映を呼んだ（%d 回）", s.applies)
+			}
+			if s.atomicBody != nil {
+				t.Error("一括置き換えのリクエストが送られている")
+			}
+			// 反映を行わないため、排他は通常どおり解放される。
+			want := timeString(now)
+			if got := zoneLockDeadline(s); got != want {
+				t.Errorf("排他が解放されていない: deadline=%q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// 空を返すことと省略は別である（D11 の判断が生きていること）。
+func TestZoneApplier_EmptyIsNotSkip(t *testing.T) {
+	now := fixedNow()
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := testApplier(c, "alice", now)
+
+	err := a.Apply(context.Background(), func(_ context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		return nil, nil
+	})
+	if errors.Is(err, ErrSkipApply) {
+		t.Fatal("空の結果が省略として扱われている")
+	}
+	if !errors.Is(err, ErrNoRecords) {
+		t.Fatalf("ErrNoRecords を期待したが %v", err)
+	}
+}
+
+// 省略の後は延長が走らない。
+func TestZoneApplier_NoRenewAfterSkip(t *testing.T) {
+	now := fixedNow()
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := testApplier(c, "alice", now, WithRenewInterval(time.Millisecond))
+
+	if err := a.Apply(context.Background(), skipAll); err != nil {
+		t.Fatalf("省略は成功として返ること: %v", err)
+	}
+	before := zoneLabelPutCount(s)
+
+	time.Sleep(20 * time.Millisecond)
+	if got := zoneLabelPutCount(s); got != before {
+		t.Errorf("省略の後に延長が走っている: ゾーンのラベルの更新が %d → %d", before, got)
+	}
+}
+
+// 排他を失っていた場合、省略は成功にならない。
+//
+// 番兵を nil へ変換するのが runLockedHold の内側でなければならない理由を固定する。
+// 外側で変換すると、包まれた排他の喪失にも errors.Is が一致して消える。
+func TestZoneApplier_SkipApplyAfterLockLost(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	// 延長がただちに「保持者でない」を返す排他。レコードを用いる排他ではないため
+	// 一括置き換えは排他を消費せず、終了時の解放が行われる経路になる。
+	f := &fakeLocker{renewErr: ErrNotLockHolder}
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID,
+		WithLocker(f), WithHoldOptions(WithRenewEvery(time.Millisecond)))
+
+	err := a.Apply(context.Background(), func(ctx context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		<-ctx.Done() // 排他を失うまで待つ
+		return nil, ErrSkipApply
+	})
+	if !errors.Is(err, ErrNotLockHolder) {
+		t.Fatalf("排他の喪失が返ること: %v", err)
+	}
+	if s.atomics != 0 {
+		t.Errorf("一括置き換えを呼んだ（%d 回）", s.atomics)
+	}
+}
+
+// 打ち切られていた場合、省略は成功にならない。
+//
+// 省略の経路は API を 1 つも呼ばないため、打ち切りが表面化する経路が他に無い。
+// 解放が ctx を尊重しない排他でも成功が返らないことを見る。
+func TestZoneApplier_SkipApplyAfterCancel(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID,
+		WithLocker(&fakeLocker{}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := a.Apply(ctx, func(_ context.Context, _ []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		cancel()
+		return nil, ErrSkipApply
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("打ち切りが返ること: %v", err)
+	}
+	if s.atomics != 0 {
+		t.Errorf("一括置き換えを呼んだ（%d 回）", s.atomics)
+	}
+}
+
+// 省略した場合、解放の失敗は戻り値に現れる。
+//
+// 反映した場合は消費の印によって「残っていた場合に限り解放」となるため、解放の失敗が
+// 成功を汚さない。省略は解放が通常どおり行われる唯一の成功経路である。
+func TestZoneApplier_SkipApplyReportsReleaseFailure(t *testing.T) {
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	relErr := errors.New("解放の失敗")
+	a := NewZoneApplier(c.RecordsAPI, c.ZonesAPI, c.JobsAPI, testZoneID,
+		WithLocker(&fakeLocker{unlockErr: relErr}))
+
+	if err := a.Apply(context.Background(), skipAll); !errors.Is(err, relErr) {
+		t.Fatalf("解放の失敗が返ること: %v", err)
+	}
+	if s.atomics != 0 {
+		t.Errorf("一括置き換えを呼んだ（%d 回）", s.atomics)
 	}
 }
 
 // ---- 成功時の後始末 (T028) ----
 
-func TestZoneApplier_NoUnlockOnSuccess(t *testing.T) {
+// 一括置き換えの後も排他は保持され、通常どおり解放される（009 FR-008・SC-004）。
+//
+// 007 の時点では一括置き換えが排他を解いていたため、成功時の無条件の解放を避ける
+// 必要があった。009 で排他の状態がゾーンのラベルへ移り、レコードの一括更新とゾーン反映は
+// これに影響しなくなったため、解放は通常どおり行われる。
+func TestZoneApplier_ReleasesAfterApply(t *testing.T) {
 	now := fixedNow()
 	s := applyServer(map[string]string{})
 	c := newLockClient(t, s)
@@ -236,13 +410,44 @@ func TestZoneApplier_NoUnlockOnSuccess(t *testing.T) {
 	if err := a.Apply(context.Background(), keepAll); err != nil {
 		t.Fatalf("成功した操作が失敗として返った: %v", err)
 	}
-	// 一括置き換えの後、SOA は反映済みで排他のラベルを持たない。
-	soa := s.find(testSOAID)
-	if soa.state != 0 {
-		t.Errorf("SOA が反映済みでない: state=%d", soa.state)
+	// 排他のラベルは残り、奪ってよい時刻が現在時刻になっている（= 解放済み）。
+	if got := zoneLockOwner(s); got != "alice" {
+		t.Errorf("排他のラベルが失われた: owner=%q labels=%v", got, zoneLabelsOf(s))
 	}
-	if _, ok := soa.labels[LockDeadlineLabelKey]; ok {
-		t.Errorf("排他のラベルが残っている: %v", soa.labels)
+	if got := zoneLockDeadline(s); got != timeString(now) {
+		t.Errorf("解放されていない: deadline=%q, want %q", got, timeString(now))
+	}
+	// SOA は一括置き換えで作り直されるが、排他のラベルは付いていない。
+	soa := s.find(testSOAID)
+	if len(soa.labels) != 0 {
+		t.Errorf("SOA に排他のラベルが付いている: %v", soa.labels)
+	}
+}
+
+// 一括置き換えの直後、反映の完了前の時点でも排他は保持されている。
+// 反映によって排他が解かれないことを、保持者の判定で確かめる。
+func TestZoneApplier_LockSurvivesAtomicChanges(t *testing.T) {
+	now := fixedNow()
+	s := applyServer(map[string]string{})
+	c := newLockClient(t, s)
+	a := testApplier(c, "alice", now)
+
+	var heldAfterApply bool
+	err := a.Apply(context.Background(), func(_ context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
+		return records, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 反映の後に他者が取得を試みると、解放済みであるため取得できる。
+	// 「反映が排他を解いた」のではなく「Apply が通常どおり解放した」ことを、
+	// 解放の書き込みがあったかどうかで区別する。
+	if n := zoneLabelPutCount(s); n < 2 {
+		t.Errorf("ゾーンのラベルの更新が %d 回。取得と解放で 2 回以上であること", n)
+	}
+	heldAfterApply = zoneLabelOf(s, ZoneLockLabelKey) != ""
+	if !heldAfterApply {
+		t.Error("一括置き換えの後に排他のラベルが消えている。反映は排他に影響しないこと")
 	}
 }
 
@@ -299,9 +504,8 @@ func TestZoneApplier_ReleasesOnFailure(t *testing.T) {
 				t.Errorf("エラーが判別できない: %v", err)
 			}
 			// 排他が解放されている（奪ってよい時刻が現在時刻）。
-			soa := s.find(testSOAID)
-			if got := soa.labels[LockDeadlineLabelKey]; got != timeString(now) {
-				t.Errorf("排他が解放されていない: deadline=%q labels=%v", got, soa.labels)
+			if got := zoneLockDeadline(s); got != timeString(now) {
+				t.Errorf("排他が解放されていない: deadline=%q labels=%v", got, zoneLabelsOf(s))
 			}
 		})
 	}
@@ -316,11 +520,11 @@ func TestZoneApplier_NoRenewDuringApply(t *testing.T) {
 	// 延長の間隔を極端に短くし、編集の中で待つ。反映の最中に延長が走らないことを見る。
 	a := testApplier(c, "alice", now, WithRenewInterval(time.Millisecond))
 
-	var patchesBeforeApply int
+	var putsBeforeApply int
 	err := a.Apply(context.Background(), func(ctx context.Context, records []dpf.OverwriteRecordsInner) ([]dpf.OverwriteRecordsInner, error) {
-		// 編集中は延長が走る。
-		before := patchCount(s)
-		if !waitPatchAbove(s, before, time.Second) {
+		// 編集中は延長が走る（延長はゾーンのラベルの更新である）。
+		before := zoneLabelPutCount(s)
+		if !waitZoneLabelPutAbove(s, before, time.Second) {
 			t.Error("編集中に延長が走っていない")
 		}
 		return records, nil
@@ -328,12 +532,12 @@ func TestZoneApplier_NoRenewDuringApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	patchesBeforeApply = patchCount(s)
+	putsBeforeApply = zoneLabelPutCount(s)
 
-	// 反映の後は延長が走らない。
+	// 反映の後は延長が走らない。解放の 1 回だけが増える。
 	time.Sleep(20 * time.Millisecond)
-	if got := patchCount(s); got != patchesBeforeApply {
-		t.Errorf("反映の後に延長が走っている: PATCH が %d → %d", patchesBeforeApply, got)
+	if got := zoneLabelPutCount(s); got > putsBeforeApply+1 {
+		t.Errorf("反映の後に延長が走っている: ゾーンのラベルの更新が %d → %d", putsBeforeApply, got)
 	}
 }
 
@@ -416,6 +620,17 @@ func (e *ApplyTestEnv) OverwriteFlags() (soa, apexNS *bool) {
 	return e.s.atomicBody.OverwriteSoa, e.s.atomicBody.OverwriteZoneApexNs
 }
 
+// ZoneLabels はゾーンのラベルの複製を返す。既定の排他はここに状態を書く。
+func (e *ApplyTestEnv) ZoneLabels() map[string]string {
+	e.s.mu.Lock()
+	defer e.s.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range e.s.zoneLabels {
+		out[k] = v
+	}
+	return out
+}
+
 // SOALabels は SOA レコードのラベルの複製を返す。
 func (e *ApplyTestEnv) SOALabels() map[string]string {
 	e.s.mu.Lock()
@@ -489,7 +704,9 @@ func TestNewZoneApplier_DefaultsToRecordMutex(t *testing.T) {
 	if mu.zoneID != testZoneID {
 		t.Errorf("排他のゾーンが %q、期待は %q", mu.zoneID, testZoneID)
 	}
-	if !consumesLockOnZoneApply(mu) {
-		t.Error("既定の排他が「一括置き換えで解かれる」と申告していない")
+	// 009 以降、既定の排他はゾーンのラベルを使う。レコードの一括更新とゾーン反映は
+	// ゾーンのラベルに影響しないため、「解かれる」とは申告しない。
+	if consumesLockOnZoneApply(mu) {
+		t.Error("既定の排他が「一括置き換えで解かれる」と申告している")
 	}
 }

@@ -306,3 +306,73 @@ US3 は US1 と独立であり、先に実装してもよい。ただし US2 は
 | SC-009（利用者のラベルが失われない） | 編集関数へ `applier.test.dpf-go=keep-...` が渡り、Apply の後も残存。SOA の ID は `rjqmfs7z0y8ncw` → `rmythc789x0bqk` と変わっている |
 
 D1b（反映済みのラベルは残る）は、利用者による確認から**実測による確認**になった。
+
+## 追記: 反映の省略 (FR-018b、2026-09-25)
+
+公開されているレコードを読んだ結果、反映が不要な場合の経路を足した
+（[research.md](./research.md) D13、[contracts/api.md](./contracts/api.md) 第 2 節の約束 5）。
+
+- [X] T056 `utils/apply.go` に番兵 `ErrSkipApply` を定義し、`ErrNoRecords`（空は失敗）との
+  違いを godoc に書く
+- [X] T057 `utils/apply.go` の `Apply` で、`runLockedHold` へ渡す関数の**内側**で番兵を nil へ
+  変換する。打ち切られていた場合は `ctx.Err()` を返す。外側で変換できない理由を実装
+  コメントに残す（D13）
+- [X] T058 `utils/apply.go` の `ZoneRecordsEditor` と `Apply` の godoc を更新する。`errors.Is`
+  で判定するため包むとメッセージが捨てられること、`errors.Join` で束ねてはならないこと、
+  省略は解放の失敗が戻り値に現れる唯一の成功経路であること、省略しても排他の取得と解放は
+  走ること
+- [X] T059 `utils/apply_test.go` に省略の単体テストを追加する。省略の基本、一覧とともに
+  返した場合、包んだ場合、束ねた場合、空との区別、省略後に延長が走らないこと、排他を
+  失っていた場合、打ち切られていた場合、解放が失敗した場合
+- [X] T060 `utils/locker_ext_test.go` に、差し替えた排他でも省略の後に解放されることの
+  テストを追加する
+- [X] T061 `utils/doc.go` と `utils/example_test.go`（`ExampleZoneApplier_Apply_skipApply`）を
+  更新する
+- [X] T062 `internal/integration/lockflow_test.go` に `TestZoneApplierSkipApply` を追加する
+- [X] T063 `CHANGELOG.md` の `[Unreleased]` に機能追加を記載する
+- [X] T064 `make test-integration` を実行し、全件が通ることを確認する。**トークン未設定で
+  スキップされた結果を確認結果として報告しない**（憲章 品質ゲート）
+
+### 単体テストが押さえている設計判断（変異による確認）
+
+`ctx.Err()` の検査を外すと `TestZoneApplier_SkipApplyAfterCancel` が落ちる。番兵を nil へ
+変換する位置を `runLockedHold` の外側へ移すと `TestZoneApplier_SkipApplyAfterLockLost`・
+`TestZoneApplier_SkipApplyAfterCancel`・`TestZoneApplier_SkipApplyReportsReleaseFailure` の
+3 本が落ちる。いずれも 2026-09-25 に実際に変異させて確認した。
+
+## フェーズ 7: 収束 (Convergence、2026-09-25)
+
+`/speckit-converge` が spec.md・plan.md・tasks.md と現在のコードを突き合わせ、残作業として
+検出した項目である。追記のみであり、既存のタスクは書き換えていない。
+
+`make test-integration` の未実行は既存の **T064** で追跡しているため、ここでは重複させない。
+
+- [X] T065 `quickstart.md` 第 4 節の個別実行のコマンドを直す。`-run 'TestLockFlow|TestZoneMutex'`
+  は `TestZoneApplierApply` にも `TestZoneApplierSkipApply` にも一致せず、確認したい対象
+  （FR-013・FR-018b・SC-003〜SC-009）が個別実行から漏れている。`TestZoneApplier` を対象に
+  含める（FR-028、partial）
+- [X] T066 `quickstart.md` 第 4 節の期待表に、編集が `ErrSkipApply` を返した場合の確認を
+  追加する。一括置き換えが行われないこと、排他が解放されること（反映した場合と異なり
+  通常どおり解放される）（FR-018b、partial）
+- [X] T067 `quickstart.md` 第 5 節の文書の確認表に行を追加する。`utils/apply.go` の
+  `ErrSkipApply` の godoc（空との違い、包んだ場合はメッセージが捨てられること、解放の失敗が
+  戻り値に現れること）と、`utils/example_test.go` の `ExampleZoneApplier_Apply_skipApply` の
+  有無を確認する（FR-018b、partial）
+
+### 実測で確認できたこと（省略の経路、2026-09-25）
+
+`make test-integration` を全件実行し、`TestZoneApplierSkipApply` を含めてすべて通過した
+（`ok github.com/iij/dpf-go/internal/integration 671.172s`）。トークンは 3 つとも設定済みで
+あり、スキップされた項目はない。
+
+| 確認すること | 証拠 |
+|---|---|
+| 一括置き換えが行われない | SOA の ID が `r2s1vb6qp4nw3t` のまま変わらない。直前の `TestZoneApplierApply` では `rcj74rhv6le1w0` → `r2s1vb6qp4nw3t` と**作り直されている**。公開されているゾーンのシリアルと履歴が動かないことの直接の証拠である |
+| 編集の一覧が使われない | 番兵とともに返した `_dpf-go-ci-skip-...` の TXT が作られていない |
+| 排他が解放される | `[省略の後] owner="dpf-go-ci" deadline="1790319252"`。owner のラベルは残るが奪ってよい時刻が解放時刻であり、保持の判定は false |
+| 反映と JOB の待ちが無くなる | 27.55s。反映した `TestZoneApplierApply` は 72.82s |
+| 省略は SOA に未反映の編集を残す | `[省略の後] 未反映件数=1`。取得・解放がゾーン反映を伴わないためであり、反映より前で失敗した場合と同じ状態である（[research.md](./research.md) D13） |
+
+**後始末のメッセージについて**: このテストの `resetPendingChanges` は「前回の実行が中断された
+可能性がある」と記録するが、省略の経路では未反映の編集 1 件は**設計どおり**残るものである。
+中断の痕跡ではない。

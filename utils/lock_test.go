@@ -16,8 +16,10 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	dpf "github.com/iij/dpf-go"
+	"github.com/miekg/dns"
 )
 
 const (
@@ -87,6 +89,24 @@ type lockServer struct {
 
 	// patchHook は PATCH の直前に呼ばれる。延長中の横取りの再現に使う。
 	patchHook func(s *lockServer, recordID string, labels map[string]string)
+
+	// zoneLabels はゾーンのラベル。**PUT はマップ全体の置き換えとして扱う**
+	// （渡されなかったラベルは消える）。実 API と同じ振る舞いにすることで、
+	// 他のラベルを書き戻さない誤りをテストが検出できる。
+	zoneLabels map[string]string
+	// zoneLabelGets / zoneLabelPuts はゾーンのラベルの呼び出し回数。
+	zoneLabelGets int
+	zoneLabelPuts int
+	// zoneLabelGetErr はゾーンのラベルの取得を失敗させる。
+	zoneLabelGetErr bool
+	// zoneLabelPutFailN はゾーンのラベルの更新を指定回数だけ失敗させる。
+	zoneLabelPutFailN int
+	// zoneLabelPutHook は PUT の直前に呼ばれる。延長中の横取りの再現に使う。
+	zoneLabelPutHook func(s *lockServer, labels map[string]string)
+
+	// recordGets はレコード一覧の取得の回数。ゾーン名の取得が 2 回目以降
+	// 行われないことの確認に使う。
+	recordGets int
 
 	// patchFailN が正の場合、その回数だけ PATCH を 500 で失敗させる。
 	// 延長の一時的な失敗の再現に使う。
@@ -209,6 +229,7 @@ func newLockServer(labels map[string]string, state int) *lockServer {
 			applied: labels,
 			state:   state,
 		}},
+		zoneLabels: map[string]string{},
 	}
 }
 
@@ -329,6 +350,51 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 		rest := parts[2:]
 
 		switch {
+		// ゾーンのラベルの取得。
+		case len(rest) == 1 && rest[0] == "labels" && r.Method == http.MethodGet:
+			s.zoneLabelGets++
+			if s.zoneLabelGetErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"request_id":"x","error_type":"SystemError","error_message":"e"}`))
+				return
+			}
+			b, _ := json.Marshal(map[string]any{
+				"request_id": "x",
+				"result":     map[string]any{"labels": s.zoneLabels},
+			})
+			_, _ = w.Write(b)
+
+		// ゾーンのラベルの更新。**マップ全体の置き換えである。**
+		case len(rest) == 1 && rest[0] == "labels" && r.Method == http.MethodPut:
+			s.zoneLabelPuts++
+			if s.zoneLabelPutFailN > 0 {
+				s.zoneLabelPutFailN--
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"request_id":"x","error_type":"SystemError","error_message":"e"}`))
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			var pr struct {
+				Labels map[string]string `json:"labels"`
+			}
+			if err := json.Unmarshal(body, &pr); err != nil {
+				t.Errorf("unmarshal put labels body: %v", err)
+			}
+			if s.zoneLabelPutHook != nil {
+				s.zoneLabelPutHook(s, pr.Labels)
+			}
+			if pr.Labels == nil {
+				pr.Labels = map[string]string{}
+			}
+			// 保持者が変わらず奪ってよい時刻だけが変わった PUT を延長として数える。
+			oldOwner, oldDeadline, oldOK := parseLockValue(s.zoneLabels[ZoneLockLabelKey])
+			newOwner, newDeadline, newOK := parseLockValue(pr.Labels[ZoneLockLabelKey])
+			if oldOK && newOK && oldOwner == newOwner && oldDeadline != newDeadline {
+				s.renews++
+			}
+			s.zoneLabels = pr.Labels
+			writeAccepted(w)
+
 		// ゾーン反映。排他の操作では呼ばれてはならない（006 FR-026・SC-004）。
 		case len(rest) == 1 && rest[0] == "changes":
 			s.applies++
@@ -370,6 +436,7 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 			_, _ = w.Write([]byte(s.currentsJSON()))
 
 		case len(rest) == 1 && rest[0] == "records" && r.Method == http.MethodGet:
+			s.recordGets++
 			if s.getErr {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"request_id":"x","error_type":"SystemError","error_message":"e"}`))
@@ -493,17 +560,41 @@ func newLockClient(t *testing.T, s *lockServer) *dpf.APIClient {
 	return dpf.NewAPIClient(cfg)
 }
 
+// lockLabel は排他の状態を表すゾーンのラベルを 1 つ持つマップを返す。
 func lockLabel(owner string, deadline int64) map[string]string {
-	return map[string]string{
-		LockOwnerLabelKey:    owner,
-		LockDeadlineLabelKey: strconv.FormatInt(deadline, 10),
+	return map[string]string{ZoneLockLabelKey: lockValue(owner, time.Unix(deadline, 0))}
+}
+
+// zoneLockOwner はゾーンのラベルに書かれた排他の保持者を返す。
+func zoneLockOwner(s *lockServer) string {
+	owner, _, _ := parseLockValue(zoneLabelOf(s, ZoneLockLabelKey))
+	return owner
+}
+
+// zoneLockDeadline はゾーンのラベルに書かれた奪ってよい時刻を 10 進表記で返す。
+// 排他のラベルが無い場合、および形式を満たさない場合は空文字を返す。
+func zoneLockDeadline(s *lockServer) string {
+	_, d, ok := parseLockValue(zoneLabelOf(s, ZoneLockLabelKey))
+	if !ok {
+		return ""
 	}
+	return strconv.FormatInt(d, 10)
+}
+
+// lockedServer は排他が保持されている状態の模擬サーバを返す。
+//
+// 排他の状態は**ゾーンのラベル**に置く。SOA のラベルには何も置かない。SOA の state も
+// 排他の判定には関係しない（ゾーンのラベルは未反映の編集の概念を持たない）。
+func lockedServer(owner string, deadline int64) *lockServer {
+	s := newLockServer(nil, 0)
+	s.zoneLabels = lockLabel(owner, deadline)
+	return s
 }
 
 // testMutex は now とポーリング間隔を固定したテスト用 Mutex を返す。
 func testMutex(c *dpf.APIClient, owner string, now time.Time, opts ...Option) *Mutex {
 	opts = append([]Option{WithOwner(owner), WithTTL(time.Hour), WithVerifyTimeout(20 * time.Millisecond)}, opts...)
-	m := NewMutex(c.RecordsAPI, testZoneID, opts...)
+	m := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, opts...)
 	m.now = func() time.Time { return now }
 	m.pollInterval = time.Millisecond
 	return m
@@ -520,8 +611,8 @@ func TestNewOwner_UniquePerInstance(t *testing.T) {
 	s := newLockServer(nil, 0)
 	c := newLockClient(t, s)
 
-	a := NewMutex(c.RecordsAPI, testZoneID)
-	b := NewMutex(c.RecordsAPI, testZoneID)
+	a := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)
+	b := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)
 
 	if a.Owner() == b.Owner() {
 		t.Errorf("owner がインスタンス間で同一である: %q", a.Owner())
@@ -553,34 +644,51 @@ func TestNewOwner_UniquePerInstance(t *testing.T) {
 
 func TestLockable_IgnoresOwner(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("alice", now.Unix()+3600), 3)
+	s := lockedServer("alice", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
-	if m.lockable(s.records[0].labels) {
+	if m.lockable(zoneLabelsOf(s)) {
 		t.Error("owner が自分自身でも、奪ってよい時刻の前は取得できてはならない")
 	}
 }
 
-func TestLockable_InvalidDeadline(t *testing.T) {
+// 形式を満たさない値は「排他が成立していない」として扱う。解釈できない値に
+// 引きずられて、ゾーンが永久に取得できない状態にしないためである
+// （009 contracts/zone-label.md 第 5 節）。
+func TestLockable_InvalidValue(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(map[string]string{
-		LockOwnerLabelKey:    "bob",
-		LockDeadlineLabelKey: "not-a-number",
-	}, 3)
-	c := newLockClient(t, s)
-	m := testMutex(c, "alice", now)
+	for _, v := range []string{
+		"",                    // 空
+		"bob",                 // 区切りも時刻も無い
+		"bob-notanumber",      // 末尾が数字でない
+		"bob-179031925",       // 9 桁（1 桁足りない）
+		"bob_1790319252",      // 区切りが違う
+		"-1790319252",         // 保持者が空
+		"bob-1790319252extra", // 末尾が時刻でない
+	} {
+		t.Run(v, func(t *testing.T) {
+			s := newLockServer(map[string]string{}, 0)
+			setZoneLabels(s, map[string]string{ZoneLockLabelKey: v})
+			c := newLockClient(t, s)
+			m := testMutex(c, "alice", now)
 
-	if !m.lockable(s.records[0].labels) {
-		t.Error("奪ってよい時刻が解釈できない場合は取得を許さなければならない")
+			if !m.lockable(zoneLabelsOf(s)) {
+				t.Errorf("形式を満たさない値 %q では取得を許さなければならない", v)
+			}
+			if err := m.Lock(context.Background()); err != nil {
+				t.Errorf("形式を満たさない値 %q で取得できなかった: %v", v, err)
+			}
+		})
 	}
 }
 
-func TestGetSOA_PrefersEditing(t *testing.T) {
+// getSOA はゾーン名を得るためだけに使う。排他の判定には使わないため、state を
+// 問わず名前が得られればよい（009）。
+func TestGetSOA_AnyState(t *testing.T) {
 	now := fixedNow()
 	s := newLockServer(map[string]string{}, 0)
-	s.addRecord(&testRecord{id: "soaeditingid01", name: testZoneName, rrtype: "SOA",
-		labels: lockLabel("bob", now.Unix()+3600), state: 3})
+	s.addRecord(&testRecord{id: "soaeditingid01", name: testZoneName, rrtype: "SOA", state: 3})
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -588,33 +696,50 @@ func TestGetSOA_PrefersEditing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if soa.State != dpf.RECORDSSTATE__3 {
-		t.Errorf("state=%v を返した。編集予定(3)を優先しなければならない", soa.State)
-	}
-	if soa.Labels[LockOwnerLabelKey] != "bob" {
-		t.Errorf("編集中のラベルを読めていない: %v", soa.Labels)
+	if dns.CanonicalName(soa.Name) != dns.CanonicalName(testZoneName) {
+		t.Errorf("ゾーン名を得られていない: got %q", soa.Name)
 	}
 }
 
-func TestGetSOA_Ambiguous(t *testing.T) {
+// 編集予定と反映済みの SOA が並存していてもゾーン名は一意に決まる。
+func TestGetSOA_EditingAndAppliedCoexist(t *testing.T) {
 	now := fixedNow()
 	s := newLockServer(map[string]string{}, 0)
-	s.addRecord(&testRecord{id: "soaduplicate01", name: testZoneName, rrtype: "SOA", state: 0})
+	s.addRecord(&testRecord{id: "soaduplicate01", name: testZoneName, rrtype: "SOA", state: 3})
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
-	if _, err := m.getSOA(context.Background()); err == nil {
-		t.Error("同じ state の SOA が複数あるときはエラーを返さなければならない")
+	soa, err := m.getSOA(context.Background())
+	if err != nil {
+		t.Fatalf("並存していてもゾーン名は得られること: %v", err)
+	}
+	if dns.CanonicalName(soa.Name) != dns.CanonicalName(testZoneName) {
+		t.Errorf("ゾーン名を得られていない: got %q", soa.Name)
 	}
 }
 
+// SOA が 1 件も無い場合は ErrRecordNotFound。
+func TestGetSOA_NotFound(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	s.records = nil
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	if _, err := m.getSOA(context.Background()); !errors.Is(err, ErrRecordNotFound) {
+		t.Errorf("ErrRecordNotFound を期待したが %v", err)
+	}
+}
+
+// ラベルの上限は**ゾーンのラベル**で判定する（009 FR-006）。
 func TestAcquirable_LabelLimit(t *testing.T) {
 	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
 	labels := map[string]string{}
-	for i := 0; i < 9; i++ {
+	for i := 0; i < maxZoneLabels; i++ {
 		labels[fmt.Sprintf("k%d.example", i)] = "v"
 	}
-	s := newLockServer(labels, 0)
+	setZoneLabels(s, labels)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -624,8 +749,28 @@ func TestAcquirable_LabelLimit(t *testing.T) {
 	if s.posts != 0 {
 		t.Errorf("ラベル上限では専用レコードを作ってはならない（POST %d 回）", s.posts)
 	}
-	if s.patches != 0 {
-		t.Errorf("ラベル上限では書き込みを試みてはならない（PATCH %d 回）", s.patches)
+	if n := zoneLabelPutCount(s); n != 0 {
+		t.Errorf("ラベル上限では書き込みを試みてはならない（PUT %d 回）", n)
+	}
+}
+
+// 上限の 1 つ手前（9 個）なら取得できる。排他が消費するのは 1 個である（SC-009）。
+func TestAcquirable_LabelLimitBoundary(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	labels := map[string]string{}
+	for i := 0; i < maxZoneLabels-1; i++ {
+		labels[fmt.Sprintf("k%d.example", i)] = "v"
+	}
+	setZoneLabels(s, labels)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("ラベルが 9 個なら取得できること: %v", err)
+	}
+	if got := len(zoneLabelsOf(s)); got != maxZoneLabels {
+		t.Errorf("取得後のゾーンのラベルが %d 個。排他は 1 個だけ消費すること", got)
 	}
 }
 
@@ -633,7 +778,8 @@ func TestAcquirable_LabelLimit(t *testing.T) {
 
 func TestMutexLock_Success(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(map[string]string{"keep.example": "v"}, 0)
+	s := newLockServer(map[string]string{}, 0)
+	setZoneLabels(s, map[string]string{"keep.example": "v"})
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -641,20 +787,27 @@ func TestMutexLock_Success(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	soa := s.find(testSOAID)
-	if got := soa.labels[LockOwnerLabelKey]; got != "alice" {
+	if got := zoneLockOwner(s); got != "alice" {
 		t.Errorf("owner: got %q, want alice", got)
 	}
 	want := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
-	if got := soa.labels[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("deadline: got %q, want %q", got, want)
 	}
-	if soa.state != 3 {
-		t.Errorf("SOA が編集予定になっていない: state=%d", soa.state)
+	// **レコードのラベルは触らない**（009 FR-001・SC-005）。
+	soa := s.find(testSOAID)
+	if len(soa.labels) != 0 {
+		t.Errorf("SOA のラベルが書かれている: %v", soa.labels)
 	}
-	// T023: 既存のラベルが保持される
-	if got := soa.labels["keep.example"]; got != "v" {
-		t.Errorf("既存のラベルが失われた: %v", soa.labels)
+	if soa.state != 0 {
+		t.Errorf("SOA が編集予定になっている: state=%d。排他はレコードを触らないこと", soa.state)
+	}
+	if n := s.patches; n != 0 {
+		t.Errorf("レコードの更新が %d 回。排他はレコードを触らないこと", n)
+	}
+	// 利用者のゾーンのラベルが保持される（書き込みはマップ全体の置き換えである）
+	if got := zoneLabelsOf(s)["keep.example"]; got != "v" {
+		t.Errorf("利用者のゾーンのラベルが失われた: %v", zoneLabelsOf(s))
 	}
 	// 専用レコードは残らない
 	if recs := s.lockRecordsOf(); len(recs) != 0 {
@@ -686,7 +839,7 @@ func TestMutexLock_NoReentry(t *testing.T) {
 
 func TestMutexLock_PrecheckSkipsLockRecord(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -709,7 +862,7 @@ func TestMutexLock_PrecheckAndGuardedDisagree(t *testing.T) {
 
 	// 専用レコードが作られた直後に、他者が排他を取得した状況を作る。
 	s.postHook = func(s *lockServer, _ *testRecord) {
-		s.find(testSOAID).labels = lockLabel("bob", now.Unix()+3600)
+		s.zoneLabels = lockLabel("bob", now.Unix()+3600)
 		s.find(testSOAID).state = 3
 	}
 
@@ -719,7 +872,7 @@ func TestMutexLock_PrecheckAndGuardedDisagree(t *testing.T) {
 	if s.patches != 0 {
 		t.Errorf("本判定で取得できない場合は書き込んではならない（PATCH %d 回）", s.patches)
 	}
-	if got := s.find(testSOAID).labels[LockOwnerLabelKey]; got != "bob" {
+	if got := zoneLockOwner(s); got != "bob" {
 		t.Errorf("他者の排他を上書きした: owner=%q", got)
 	}
 	if recs := s.lockRecordsOf(); len(recs) != 0 {
@@ -780,21 +933,21 @@ func TestMutexLock_LockRecordRaceLowestIDWins(t *testing.T) {
 	if err := m2.Lock(context.Background()); err != nil {
 		t.Fatalf("勝者は取得に成功しなければならない: %v", err)
 	}
-	if got := s2.find(testSOAID).labels[LockOwnerLabelKey]; got != "alice" {
+	if got := zoneLockOwner(s2); got != "alice" {
 		t.Errorf("勝者の排他が書かれていない: owner=%q", got)
 	}
 }
 
 func TestMutexLock_StealsExpiredLock(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()-1), 3)
+	s := lockedServer("bob", now.Unix()-1)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
 	if err := m.Lock(context.Background()); err != nil {
 		t.Fatalf("失効した排他は奪えなければならない: %v", err)
 	}
-	if got := s.find(testSOAID).labels[LockOwnerLabelKey]; got != "alice" {
+	if got := zoneLockOwner(s); got != "alice" {
 		t.Errorf("owner: got %q, want alice", got)
 	}
 }
@@ -847,7 +1000,7 @@ func TestMutexLock_RecoversFromPublishedLockRecord(t *testing.T) {
 	if err := m.Lock(context.Background()); err != nil {
 		t.Fatalf("公開済みの専用レコードからは回復しなければならない: %v", err)
 	}
-	if got := s.find(testSOAID).labels[LockOwnerLabelKey]; got != "alice" {
+	if got := zoneLockOwner(s); got != "alice" {
 		t.Errorf("排他が書かれていない: owner=%q", got)
 	}
 
@@ -913,7 +1066,7 @@ func TestMutexLock_RetriesOnlyOnce(t *testing.T) {
 
 func TestMutexRenew(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("alice", now.Unix()+60), 3)
+	s := lockedServer("alice", now.Unix()+60)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -921,7 +1074,7 @@ func TestMutexRenew(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
-	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("deadline: got %q, want %q", got, want)
 	}
 	if s.posts != 0 {
@@ -936,7 +1089,7 @@ func TestMutexRenew_NotHolder(t *testing.T) {
 	now := fixedNow()
 
 	// 他者が保持している。
-	s := newLockServer(lockLabel("bob", now.Unix()+60), 3)
+	s := lockedServer("bob", now.Unix()+60)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 	if err := m.Renew(context.Background()); !errors.Is(err, ErrNotLockHolder) {
@@ -958,7 +1111,7 @@ func TestMutexRenew_NotHolder(t *testing.T) {
 func TestMutexRenew_Stolen(t *testing.T) {
 	now := fixedNow()
 	// 保持中に他者へ奪われた状態。
-	s := newLockServer(lockLabel("bob", now.Unix()+60), 3)
+	s := lockedServer("bob", now.Unix()+60)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -972,7 +1125,7 @@ func TestMutexRenew_Stolen(t *testing.T) {
 
 func TestMutexUnlock(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("alice", now.Unix()+3600), 3)
+	s := lockedServer("alice", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -980,10 +1133,10 @@ func TestMutexUnlock(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := strconv.FormatInt(now.Unix(), 10)
-	if got := s.patched[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("deadline: got %q, want %q (now)", got, want)
 	}
-	if got := s.patched[LockOwnerLabelKey]; got != "alice" {
+	if got := zoneLockOwner(s); got != "alice" {
 		t.Errorf("owner ラベルは維持されること: got %q", got)
 	}
 	if s.applies != 0 {
@@ -1007,19 +1160,19 @@ func TestMutexUnlock_NoLock(t *testing.T) {
 
 func TestMutexUnlock_NotHolder(t *testing.T) {
 	now := fixedNow()
-	before := lockLabel("bob", now.Unix()+3600)
-	s := newLockServer(before, 3)
+	s := lockedServer("bob", now.Unix()+3600)
+	before := zoneLabelOf(s, ZoneLockLabelKey)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
 	if err := m.Unlock(context.Background()); !errors.Is(err, ErrNotLockHolder) {
 		t.Fatalf("ErrNotLockHolder を期待したが %v", err)
 	}
-	if s.patched != nil {
-		t.Errorf("他者の排他を変更してはならない: %v", s.patched)
+	if n := zoneLabelPutCount(s); n != 0 {
+		t.Errorf("他者の排他を変更してはならない（PUT %d 回）", n)
 	}
-	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != before[LockDeadlineLabelKey] {
-		t.Errorf("他者の deadline が変わっている: %q", got)
+	if got := zoneLabelOf(s, ZoneLockLabelKey); got != before {
+		t.Errorf("他者の排他が変わっている: got %q, want %q", got, before)
 	}
 }
 
@@ -1051,7 +1204,7 @@ func TestMutexLockWait_NonStillLockError(t *testing.T) {
 
 func TestMutexLockWait_CtxCancel(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -1064,7 +1217,7 @@ func TestMutexLockWait_CtxCancel(t *testing.T) {
 
 func TestMutexLockWait_OneCallPerAttempt(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -1085,7 +1238,7 @@ func TestMutexLockWait_OneCallPerAttempt(t *testing.T) {
 func TestMutexDefaults(t *testing.T) {
 	s := newLockServer(nil, 0)
 	c := newLockClient(t, s)
-	m := NewMutex(c.RecordsAPI, testZoneID)
+	m := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)
 
 	if m.ttl != DefaultLockTTL {
 		t.Errorf("ttl: got %v, want %v", m.ttl, DefaultLockTTL)
@@ -1104,7 +1257,7 @@ func TestMutexDefaults(t *testing.T) {
 	}
 
 	// 0 値・空値は無視して既定のままとする。
-	m2 := NewMutex(c.RecordsAPI, testZoneID,
+	m2 := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID,
 		WithOwner(""), WithTTL(0), WithLockRecordTTL(-1),
 		WithVerifyTimeout(0), WithLockRecordLabel(""),
 		WithLockRecordContent(dpf.RECORDSRRTYPEWITHOUTSOA_A, nil))
@@ -1126,8 +1279,12 @@ func TestMutexLock_CustomLockRecord(t *testing.T) {
 	if err := m.Lock(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 専用レコードの名前はゾーン名と結合される。
-	if got := m.lockRecordName(&dpf.Record{Name: testZoneName}); got != "_mylock."+testZoneName {
+	// 専用レコードの名前はゾーン名と結合される。ゾーン名は Lock の中で保持済みである。
+	got, err := m.lockRecordName(context.Background())
+	if err != nil {
+		t.Fatalf("専用レコード名を得られない: %v", err)
+	}
+	if got != "_mylock."+testZoneName {
 		t.Errorf("専用レコード名: got %q", got)
 	}
 }
@@ -1143,7 +1300,7 @@ func TestMutexDo_RunsUnderLock(t *testing.T) {
 	var ownerDuringFn string
 	err := m.Do(context.Background(), func(ctx context.Context) error {
 		s.mu.Lock()
-		ownerDuringFn = s.find(testSOAID).labels[LockOwnerLabelKey]
+		ownerDuringFn = zoneLockOwner(s)
 		s.mu.Unlock()
 		return nil
 	})
@@ -1155,7 +1312,7 @@ func TestMutexDo_RunsUnderLock(t *testing.T) {
 	}
 	// 終了時に解放される（奪ってよい時刻が現在時刻になる）。
 	want := strconv.FormatInt(now.Unix(), 10)
-	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("解放されていない: deadline=%q, want %q", got, want)
 	}
 	if s.applies != 0 || s.atomics != 0 {
@@ -1185,7 +1342,7 @@ func TestMutexDo_ContextIsDerived(t *testing.T) {
 
 func TestMutexDo_NotCalledWhenLocked(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := testMutex(c, "alice", now)
 
@@ -1215,7 +1372,7 @@ func TestMutexDo_ReturnsFnError(t *testing.T) {
 	}
 	// 失敗しても解放される。
 	want := strconv.FormatInt(now.Unix(), 10)
-	if got := s.find(testSOAID).labels[LockDeadlineLabelKey]; got != want {
+	if got := zoneLockDeadline(s); got != want {
 		t.Errorf("失敗時に解放されていない: deadline=%q", got)
 	}
 }
@@ -1228,18 +1385,54 @@ func doMutex(c *dpf.APIClient, owner string, now time.Time, opts ...Option) *Mut
 	return testMutex(c, owner, now, opts...)
 }
 
-// patchCount は模擬サーバの PATCH 回数を返す。
-func patchCount(s *lockServer) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.patches
+// zoneLabelsOf は模擬サーバのゾーンのラベルの複製を返す。
+//
+// **ロックを取らない。** 既存の s.find と同じ作法である。ハンドラと並行して読む
+// テストは、呼び出し側で s.mu を保持すること（保持したまま呼べるようにするため、
+// ここでは取らない）。
+func zoneLabelsOf(s *lockServer) map[string]string {
+	out := map[string]string{}
+	for k, v := range s.zoneLabels {
+		out[k] = v
+	}
+	return out
 }
 
-// waitPatchAbove は PATCH 回数が n を超えるまで待つ。超えなければ false。
-func waitPatchAbove(s *lockServer, n int, timeout time.Duration) bool {
+// zoneLabelOf は指定したキーのゾーンのラベルの値を返す。無い場合は空文字。
+// zoneLabelsOf と同じくロックを取らない。
+func zoneLabelOf(s *lockServer, key string) string {
+	return s.zoneLabels[key]
+}
+
+// setZoneLabels は前提条件としてゾーンのラベルを直接置く。
+func setZoneLabels(s *lockServer, labels map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.zoneLabels = map[string]string{}
+	for k, v := range labels {
+		s.zoneLabels[k] = v
+	}
+}
+
+// zoneLabelPutCount はゾーンのラベルの更新の回数を返す。
+func zoneLabelPutCount(s *lockServer) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zoneLabelPuts
+}
+
+// recordGetCount はレコード一覧の取得の回数を返す。
+func recordGetCount(s *lockServer) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recordGets
+}
+
+// waitZoneLabelPutAbove はゾーンのラベルの更新の回数が n を超えるまで待つ。
+func waitZoneLabelPutAbove(s *lockServer, n int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if patchCount(s) > n {
+		if zoneLabelPutCount(s) > n {
 			return true
 		}
 		time.Sleep(time.Millisecond)
@@ -1254,8 +1447,8 @@ func TestMutexDo_RenewsWhileRunning(t *testing.T) {
 	m := doMutex(c, "alice", now)
 
 	err := m.Do(context.Background(), func(ctx context.Context) error {
-		after := patchCount(s) // 取得の書き込みまでを含む
-		if !waitPatchAbove(s, after, 2*time.Second) {
+		after := zoneLabelPutCount(s) // 取得の書き込みまでを含む
+		if !waitZoneLabelPutAbove(s, after, 2*time.Second) {
 			t.Error("処理の実行中に延長が走っていない")
 		}
 		return nil
@@ -1269,25 +1462,25 @@ func TestMutexDo_RenewIntervalDefault(t *testing.T) {
 	s := newLockServer(nil, 0)
 	c := newLockClient(t, s)
 
-	m := NewMutex(c.RecordsAPI, testZoneID)
+	m := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)
 	if want := DefaultLockTTL / renewIntervalDivisor; m.renewInterval != want {
 		t.Errorf("既定の延長の間隔が %v（想定 %v）", m.renewInterval, want)
 	}
 
 	// 保持期間を変えると比が保たれる。
-	m2 := NewMutex(c.RecordsAPI, testZoneID, WithTTL(30*time.Minute))
+	m2 := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, WithTTL(30*time.Minute))
 	if want := 30 * time.Minute / renewIntervalDivisor; m2.renewInterval != want {
 		t.Errorf("保持期間 30 分での延長の間隔が %v（想定 %v）", m2.renewInterval, want)
 	}
 
 	// 明示すればその値になる。順序にも依存しない。
-	m3 := NewMutex(c.RecordsAPI, testZoneID, WithRenewInterval(time.Second), WithTTL(time.Hour))
+	m3 := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, WithRenewInterval(time.Second), WithTTL(time.Hour))
 	if m3.renewInterval != time.Second {
 		t.Errorf("WithRenewInterval が効いていない: %v", m3.renewInterval)
 	}
 
 	// 0 以下は無視される。
-	m4 := NewMutex(c.RecordsAPI, testZoneID, WithRenewInterval(0))
+	m4 := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, WithRenewInterval(0))
 	if want := DefaultLockTTL / renewIntervalDivisor; m4.renewInterval != want {
 		t.Errorf("0 が無視されていない: %v", m4.renewInterval)
 	}
@@ -1303,7 +1496,7 @@ func TestMutexDo_StolenCancelsFn(t *testing.T) {
 	err := m.Do(context.Background(), func(ctx context.Context) error {
 		// 他者が排他を奪った状況を作る。
 		s.mu.Lock()
-		s.find(testSOAID).labels = lockLabel("bob", now.Unix()+3600)
+		s.zoneLabels = lockLabel("bob", now.Unix()+3600)
 		s.mu.Unlock()
 
 		select {
@@ -1335,7 +1528,7 @@ func TestMutexDo_StolenJoinsFnError(t *testing.T) {
 	sentinel := errors.New("処理のエラー")
 	err := m.Do(context.Background(), func(ctx context.Context) error {
 		s.mu.Lock()
-		s.find(testSOAID).labels = lockLabel("bob", now.Unix()+3600)
+		s.zoneLabels = lockLabel("bob", now.Unix()+3600)
 		s.mu.Unlock()
 
 		select {
@@ -1362,12 +1555,12 @@ func TestMutexDo_TransientRenewFailure(t *testing.T) {
 	// 取得の書き込みの後、延長の 2 回を失敗させる。
 	err := m.Do(context.Background(), func(ctx context.Context) error {
 		s.mu.Lock()
-		s.patchFailN = 2
+		s.zoneLabelPutFailN = 2
 		s.mu.Unlock()
 
 		// 失敗の後に成功する延長を待つ。
-		after := patchCount(s)
-		if !waitPatchAbove(s, after+2, 2*time.Second) {
+		after := zoneLabelPutCount(s)
+		if !waitZoneLabelPutAbove(s, after+2, 2*time.Second) {
 			t.Error("一時的な失敗の後に延長が再試行されていない")
 		}
 		select {
@@ -1406,9 +1599,9 @@ func TestMutexDo_RenewLoopStopped(t *testing.T) {
 	}
 
 	// 復帰後は延長の書き込みが起きない。
-	stable := patchCount(s)
+	stable := zoneLabelPutCount(s)
 	time.Sleep(50 * time.Millisecond) // 延長の間隔 10ms の 5 倍
-	if got := patchCount(s); got != stable {
+	if got := zoneLabelPutCount(s); got != stable {
 		t.Errorf("復帰後に延長が走っている: PATCH が %d → %d", stable, got)
 	}
 }
@@ -1417,7 +1610,7 @@ func TestMutexDo_RenewLoopStopped(t *testing.T) {
 
 func TestMutexDo_LockWaitRetries(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := doMutex(c, "alice", now)
 
@@ -1425,7 +1618,7 @@ func TestMutexDo_LockWaitRetries(t *testing.T) {
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		s.mu.Lock()
-		s.find(testSOAID).labels = lockLabel("bob", now.Unix()-1)
+		s.zoneLabels = lockLabel("bob", now.Unix()-1)
 		s.mu.Unlock()
 	}()
 
@@ -1443,7 +1636,7 @@ func TestMutexDo_LockWaitRetries(t *testing.T) {
 
 func TestMutexDo_LockWaitHonorsCancel(t *testing.T) {
 	now := fixedNow()
-	s := newLockServer(lockLabel("bob", now.Unix()+3600), 3)
+	s := lockedServer("bob", now.Unix()+3600)
 	c := newLockClient(t, s)
 	m := doMutex(c, "alice", now)
 
@@ -1463,5 +1656,306 @@ func TestMutexDo_LockWaitHonorsCancel(t *testing.T) {
 	}
 	if s.patches != 0 {
 		t.Errorf("待機中に書き込みが発生した（PATCH %d 回）", s.patches)
+	}
+}
+
+// ---- 009 T006: 値の組み立てと読み出し ----
+
+// 値は右端から固定幅で読む。保持者に区切りと同じ文字が含まれていても曖昧にならない。
+func TestLockValue_RoundTrip(t *testing.T) {
+	deadline := time.Unix(1_790_319_252, 0)
+	for _, owner := range []string{
+		"a",                                // 1 文字
+		"alice",                            // 通常
+		"my-tool-v2",                       // 区切りと同じ文字を含む
+		"web01-12345-a1b2c3d4",             // 既定の保持者の形
+		"job-1790319252",                   // 時刻に見える文字列で終わる
+		"tool-",                            // 区切りで終わる
+		"12345678901234567890123456789012", // 32 文字
+	} {
+		t.Run(owner, func(t *testing.T) {
+			v := lockValue(owner, deadline)
+			gotOwner, gotDeadline, ok := parseLockValue(v)
+			if !ok {
+				t.Fatalf("組み立てた値を読み出せない: %q", v)
+			}
+			if gotOwner != owner {
+				t.Errorf("保持者: got %q, want %q（値 %q）", gotOwner, owner, v)
+			}
+			if gotDeadline != deadline.Unix() {
+				t.Errorf("奪ってよい時刻: got %d, want %d", gotDeadline, deadline.Unix())
+			}
+		})
+	}
+}
+
+// 奪ってよい時刻は常に 10 桁で書く。10 桁に満たない場合は 0 で詰める。
+func TestLockValue_ZeroPadsDeadline(t *testing.T) {
+	v := lockValue("alice", time.Unix(1, 0))
+	if want := "alice-0000000001"; v != want {
+		t.Errorf("got %q, want %q", v, want)
+	}
+	_, d, ok := parseLockValue(v)
+	if !ok || d != 1 {
+		t.Errorf("ゼロ詰めした値を読み出せない: ok=%v d=%d", ok, d)
+	}
+}
+
+// 値の全体はラベルの値の上限に収まる。
+func TestLockValue_FitsLabelValueLimit(t *testing.T) {
+	owner := strings.Repeat("x", maxOwnerLen)
+	if got := len(lockValue(owner, time.Unix(9_999_999_999, 0))); got > maxLabelValueLen {
+		t.Errorf("値の長さが %d。上限 %d に収まること", got, maxLabelValueLen)
+	}
+}
+
+func TestParseLockValue_Invalid(t *testing.T) {
+	for _, v := range []string{"", "x", "alice", "alice-", "-1790319252", "alice+1790319252",
+		"alice-179031925", "alice-17903192529", "alice-abcdefghij"} {
+		if _, _, ok := parseLockValue(v); ok {
+			t.Errorf("形式を満たさない値 %q を読み出せてしまった", v)
+		}
+	}
+}
+
+// ---- 009 T008: 既定の保持者 ----
+
+// ホスト名の枠は固定で、先頭を残して右側を落とす。
+func TestTruncateHost(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"web01", "web01"},
+		{strings.Repeat("a", ownerHostLen), strings.Repeat("a", ownerHostLen)},
+		{"abcdefghijklmnopqrstuvwxyz", "abcdefghijklmno"}, // 先頭 15 文字が残る
+	}
+	for _, tc := range cases {
+		if got := truncateHost(tc.in); got != tc.want {
+			t.Errorf("truncateHost(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// 既定の保持者は 32 文字に収まり、PID はゼロ詰めされない。
+func TestNewOwner_Layout(t *testing.T) {
+	owner := newOwner()
+	if n := utf8.RuneCountInString(owner); n > maxOwnerLen {
+		t.Errorf("既定の保持者が %d 文字。上限 %d に収まること: %q", n, maxOwnerLen, owner)
+	}
+	// **右から切り出す。** ホスト名自身が '-' を含みうるためである（値の読み出しを
+	// 右端から固定幅で行うのと同じ理由）。
+	i := strings.LastIndexByte(owner, '-')
+	if i < 0 {
+		t.Fatalf("既定の保持者の形が想定と異なる: %q", owner)
+	}
+	rnd, rest := owner[i+1:], owner[:i]
+	j := strings.LastIndexByte(rest, '-')
+	if j < 0 {
+		t.Fatalf("既定の保持者に PID が無い: %q", owner)
+	}
+	pid, host := rest[j+1:], rest[:j]
+
+	if got := len(host); got > ownerHostLen {
+		t.Errorf("ホスト名部分が %d 文字。枠は %d 文字であること: %q", got, ownerHostLen, owner)
+	}
+	// PID はゼロ詰めしない。
+	if want := strconv.Itoa(os.Getpid()); pid != want {
+		t.Errorf("PID 部分が %q、期待は %q（ゼロ詰めしないこと）", pid, want)
+	}
+	if len(rnd) != 8 {
+		t.Errorf("乱数部分が %q（8 桁の 16 進であること）", rnd)
+	}
+	// 呼ぶたびに異なる（乱数を含む）。
+	if newOwner() == owner {
+		t.Error("既定の保持者が呼び出しごとに変わらない")
+	}
+}
+
+// ---- 009 T016: 保持者の検証 ----
+
+// 32 文字を超える保持者では、書き込みを試みずに ErrOwnerTooLong を返す。
+func TestMutexLock_OwnerTooLong(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	long := strings.Repeat("o", maxOwnerLen+1)
+	m := testMutex(c, long, now)
+
+	if err := m.Lock(context.Background()); !errors.Is(err, ErrOwnerTooLong) {
+		t.Fatalf("ErrOwnerTooLong を期待したが %v", err)
+	}
+	if n := zoneLabelPutCount(s); n != 0 {
+		t.Errorf("書き込みを試みてはならない（PUT %d 回）", n)
+	}
+	if s.posts != 0 {
+		t.Errorf("専用レコードを作ってはならない（POST %d 回）", s.posts)
+	}
+	// 黙って切り詰めない。
+	if v := zoneLabelOf(s, ZoneLockLabelKey); v != "" {
+		t.Errorf("排他のラベルが書かれている: %q", v)
+	}
+}
+
+// ちょうど 32 文字は取得できる。
+func TestMutexLock_OwnerAtLimit(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	owner := strings.Repeat("o", maxOwnerLen)
+	m := testMutex(c, owner, now)
+
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("32 文字の保持者で取得できること: %v", err)
+	}
+	if got := zoneLockOwner(s); got != owner {
+		t.Errorf("保持者が切り詰められている: got %q (%d 文字)", got, len(got))
+	}
+}
+
+// 保持者が長すぎる場合は、取得を待つ指定があっても待たない。
+func TestMutexLockWait_OwnerTooLongDoesNotWait(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, strings.Repeat("o", maxOwnerLen+1), now)
+
+	done := make(chan error, 1)
+	go func() { done <- m.LockWait(context.Background(), 10*time.Millisecond) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrOwnerTooLong) {
+			t.Fatalf("ErrOwnerTooLong を期待したが %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("待ち続けている。保持者の長さは待っても解消しない")
+	}
+}
+
+// 空文字を指定した場合は既定の保持者が使われ、エラーにならない。
+func TestMutexLock_OwnerEmptyUsesDefault(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID, WithOwner(""), WithTTL(time.Hour),
+		WithVerifyTimeout(20*time.Millisecond))
+	m.now = func() time.Time { return now }
+	m.pollInterval = time.Millisecond
+
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("空文字は既定の保持者になること: %v", err)
+	}
+	if got := zoneLockOwner(s); got == "" {
+		t.Error("保持者が書かれていない")
+	}
+}
+
+// ---- 009 T019: ゾーン名の取得 ----
+
+// ゾーン名は一度得たら保持し、2 回目以降は SOA を読まない。
+func TestMutexLock_ZoneNameCached(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	first := recordGetCount(s)
+	if first == 0 {
+		t.Fatal("ゾーン名の取得でレコードを読んでいない")
+	}
+
+	if err := m.Unlock(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	before := recordGetCount(s)
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("2 回目の取得が失敗した: %v", err)
+	}
+	// 2 回目は専用レコードの確認でレコードを読むが、SOA は読み直さない。
+	// 読み直していれば 1 回目と同じだけ増える。
+	if got := recordGetCount(s) - before; got >= first {
+		t.Errorf("2 回目のレコード読み取りが %d 回（1 回目 %d 回）。ゾーン名を読み直している", got, first)
+	}
+}
+
+// ---- 009 T032・T033: レコードのラベルの枠 ----
+
+// SOA レコードのラベルが上限まで埋まっていても排他を取得できる（SC-005）。
+func TestMutexLock_SOALabelsFull(t *testing.T) {
+	now := fixedNow()
+	labels := map[string]string{}
+	for i := 0; i < maxZoneLabels; i++ {
+		labels[fmt.Sprintf("k%d.example", i)] = "v"
+	}
+	s := newLockServer(labels, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+
+	if err := m.Lock(context.Background()); err != nil {
+		t.Fatalf("SOA のラベルが満杯でも取得できること: %v", err)
+	}
+	// SOA のラベルは触られていない。
+	if got := len(s.find(testSOAID).labels); got != maxZoneLabels {
+		t.Errorf("SOA のラベルが %d 個に変わっている", got)
+	}
+	if n := s.patches; n != 0 {
+		t.Errorf("レコードの更新が %d 回。排他はレコードを触らないこと", n)
+	}
+}
+
+// ---- 009 T034: 区切りと同じ文字を含む保持者 ----
+
+// 区切りと同じ文字（'-'）を含む保持者でも、取得・延長・解放のすべてが成功する。
+func TestMutexLifecycle_OwnerWithSeparator(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	const owner = "my-tool-v2-1790319252"
+	m := testMutex(c, owner, now)
+	ctx := context.Background()
+
+	if err := m.Lock(ctx); err != nil {
+		t.Fatalf("取得できない: %v", err)
+	}
+	if got := zoneLockOwner(s); got != owner {
+		t.Fatalf("保持者を読み違えている: got %q, want %q", got, owner)
+	}
+	if err := m.Renew(ctx); err != nil {
+		t.Fatalf("延長できない: %v", err)
+	}
+	if err := m.Unlock(ctx); err != nil {
+		t.Fatalf("解放できない: %v", err)
+	}
+	if got := zoneLockDeadline(s); got != timeString(now) {
+		t.Errorf("解放されていない: deadline=%q", got)
+	}
+}
+
+// ---- 009 T014: 解放はラベルを削除しない ----
+
+// 解放してもラベルは残る。削除すると「一度も取得されていない」と区別が付かなくなる。
+func TestMutexUnlock_KeepsLabel(t *testing.T) {
+	now := fixedNow()
+	s := newLockServer(map[string]string{}, 0)
+	c := newLockClient(t, s)
+	m := testMutex(c, "alice", now)
+	ctx := context.Background()
+
+	if err := m.Lock(ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := m.Unlock(ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := zoneLabelsOf(s)[ZoneLockLabelKey]; !ok {
+		t.Error("解放でラベルが削除されている。削除してはならない")
+	}
+	if got := zoneLockOwner(s); got != "alice" {
+		t.Errorf("保持者が失われた: %q", got)
+	}
+	// 解放後は他者が取得できる。
+	other := testMutex(c, "bob", now)
+	if err := other.Lock(ctx); err != nil {
+		t.Errorf("解放の後に他者が取得できない: %v", err)
 	}
 }

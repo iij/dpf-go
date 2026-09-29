@@ -65,7 +65,9 @@ go test ./utils/ -race -run 'TestMutexDo|TestZoneApplier' -v
 | **取り込みの可否を決める 2 つのフラグが、常に「取り込まない」で送られる** | FR-015・FR-016・SC-003 |
 | 編集の結果に SOA / Zone Apex NS が無い場合に補われる | [research.md](./research.md) D9 |
 | 編集の結果が空の場合、API を呼ばずに `ErrNoRecords` が返る | FR-018 |
-| **成功した場合、無条件の解放が行われない**（`ErrNotLockHolder` が返らない） | FR-017・SC-004 |
+| 編集が `ErrSkipApply` を返した場合、一括置き換えを呼ばず、排他を解放して `nil` が返る | FR-018b |
+| 省略が、打ち切られていた場合と解放に失敗した場合には成功にならない | FR-018b |
+| **反映が成功した場合、無条件の解放が行われない**（`ErrNotLockHolder` が返らない） | FR-017・SC-004 |
 | 反映の後に排他が残っていた場合に限り解放される | FR-021 |
 | 反映より前の失敗で排他が解放される | SC-005 |
 | 反映のコメントが Option で指定できる | FR-020 |
@@ -112,7 +114,7 @@ make test-integration
 
 ```bash
 go test ./internal/integration/ -tags=integration -count=1 -parallel 1 -timeout 45m \
-  -run 'TestLockFlow|TestZoneMutex' -v
+  -run 'TestLockFlow|TestZoneMutex|TestZoneApplier' -v
 ```
 
 **期待**:
@@ -128,6 +130,8 @@ go test ./internal/integration/ -tags=integration -count=1 -parallel 1 -timeout 
 | 置き換えの後、排他も未反映の編集も残らない | SC-005・SC-007 |
 | `Apply` が成功した場合、`ErrNotLockHolder` が返らない | SC-004 |
 | `Mutex.Do` の中で 1 レコードずつ変更して反映し、解放まで通る | 契約 1 の約束 5 |
+| 編集が `ErrSkipApply` を返した場合、反映が行われない（レコードが作られない） | FR-018b |
+| **省略の後、排他が解放されている**（反映した場合と異なり、通常どおり解放される） | FR-018b・契約 2 の約束 5 |
 
 ### 保持期間より長い処理の確認 (SC-001)
 
@@ -146,7 +150,8 @@ go test ./internal/integration/ -tags=integration -count=1 -parallel 1 -timeout 
 |---|---|
 | `utils/lock.go` | `Mutex` の godoc が、一括置き換えについて `ZoneApplier` を案内する形になっている（「併用できない」で終わっていない） |
 | `utils/apply.go` | `ZoneApplier` の godoc が契約 第 5 節の 5 点を含む |
+| `utils/apply.go` | `ErrSkipApply` の godoc が、空（`ErrNoRecords`）との違い、包んだ場合にメッセージが捨てられること、解放の失敗が戻り値に現れることを述べている |
 | `utils/doc.go` | 2 つの操作の説明がある |
-| `utils/example_test.go` | `overwrite_soa=false` なら安全という前提で書いた例が残っていない。`ZoneApplier` と `Mutex.Do` の例がある |
+| `utils/example_test.go` | `overwrite_soa=false` なら安全という前提で書いた例が残っていない。`ZoneApplier` と `Mutex.Do` の例がある。反映を省く例（`ExampleZoneApplier_Apply_skipApply`）がある |
 | `README.md` | 88 行の `dpf/utils` の説明に 2 つの操作が入っている |
 | `CHANGELOG.md` | `[Unreleased]` に機能追加と破壊的変更がある |

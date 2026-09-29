@@ -13,6 +13,8 @@ import (
 type ZonesApi interface {
 	GetZoneList(ctx context.Context) ApiGetZoneListRequest
 	PatchZoneAtomicChanges(ctx context.Context, zoneId string) ApiPatchZoneAtomicChangesRequest
+	GetZoneLabels(ctx context.Context, zoneId string) ApiGetZoneLabelsRequest
+	PutZoneLabels(ctx context.Context, zoneId string) ApiPutZoneLabelsRequest
 }
 
 var _ ZonesApi = (*ZonesAPIService)(nil)
