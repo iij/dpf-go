@@ -1581,21 +1581,14 @@ func TestMutexDo_RenewLoopStopped(t *testing.T) {
 	c := newLockClient(t, s)
 	m := doMutex(c, "alice", now)
 
-	// doHold を直接呼び、保持の状態を取り出す。Do が復帰した時点で延長の
-	// goroutine が終了していることを、done が閉じていることで確かめる。
-	var h *hold
-	err := runLockedHold(context.Background(), m, func(ctx context.Context, hh *hold) error {
-		h = hh
-		return nil
-	})
-	if err != nil {
+	// 復帰した時点で延長の goroutine が終了していることを、**振る舞いで**確かめる。
+	//
+	// 010 より前は、保持の状態を直接取り出して done が閉じていることを見ていた。
+	// その取り出し口（fn へ hold を渡す経路）は、一括置き換えの申告の仕組みと一緒に
+	// 取り除かれた（specs/010-remove-apply-consume）。RunLocked は復帰の前に
+	// goroutine の終了を待つため、復帰後に延長の書き込みが起きないことで確かめられる。
+	if err := m.Do(context.Background(), func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-
-	select {
-	case <-h.done:
-	default:
-		t.Error("復帰時に延長の goroutine が終了していない")
 	}
 
 	// 復帰後は延長の書き込みが起きない。

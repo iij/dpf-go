@@ -67,17 +67,6 @@ type RenewIntervaler interface {
 	RenewInterval() time.Duration
 }
 
-// zoneApplyConsumer は、ゾーン全体の一括置き換えによって排他が解かれることを申告する
-// 任意のインターフェースである。
-//
-// メソッドを非公開にしているため、本パッケージの外からは実装できない。これが必要なのは
-// DPF-API のレコードを用いる排他だけであり、外部のミドルウェアを使う排他でゾーン反映が
-// 排他を解くことはないためである。すべての実装者に無関係な判断を強いないよう、意図して
-// 閉じている。
-type zoneApplyConsumer interface {
-	consumedByZoneApply() bool
-}
-
 // Locker を満たすことをコンパイル時に確認する。
 var _ Locker = (*Mutex)(nil)
 
@@ -140,26 +129,8 @@ type hold struct {
 	stopOnce sync.Once
 
 	mu sync.Mutex
-	// consumed は、この先で排他が解かれることの印。
-	consumed bool
 	// lostErr は延長によって保持者でないと判明したときのエラー。
 	lostErr error
-}
-
-// consume は、この先の操作が排他を解くことを RunLocked へ伝える。
-// 延長を止め、終了時の解放で ErrNotLockHolder を成功として扱うようにする。
-func (h *hold) consume() {
-	h.mu.Lock()
-	h.consumed = true
-	h.mu.Unlock()
-	h.stopRenew()
-}
-
-// isConsumed は consume が呼ばれたかを返す。
-func (h *hold) isConsumed() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.consumed
 }
 
 // lost は延長によって保持者でないと判明したことを記録する。
@@ -209,13 +180,6 @@ func (h *hold) stopRenew() {
 // fn の異常終了（panic）は捕捉しない。この場合、解放は行われず、排他は実装の保持期間の
 // 経過によって解ける（保持期間を持たない実装では解けない）。
 func RunLocked(ctx context.Context, l Locker, fn func(ctx context.Context) error, opts ...HoldOption) error {
-	return runLockedHold(ctx, l, func(ctx context.Context, _ *hold) error {
-		return fn(ctx)
-	}, opts...)
-}
-
-// runLockedHold は RunLocked の実装。fn へ hold を渡すため非公開にしている。
-func runLockedHold(ctx context.Context, l Locker, fn func(context.Context, *hold) error, opts ...HoldOption) error {
 	if l == nil {
 		return errors.New("dpf: RunLocked: 排他が nil である")
 	}
@@ -238,11 +202,11 @@ func runLockedHold(ctx context.Context, l Locker, fn func(context.Context, *hold
 	}
 	go renewLoop(hctx, l, h, renewIntervalOf(l, cfg.renewInterval))
 
-	fnErr := fn(hctx, h)
+	fnErr := fn(hctx)
 	h.stopRenew()
 
 	lostErr := h.lostError()
-	relErr := releaseLock(ctx, l, h)
+	relErr := releaseLock(ctx, l)
 
 	switch {
 	case lostErr != nil:
@@ -281,18 +245,9 @@ func acquireLock(ctx context.Context, l Locker, wait time.Duration) error {
 // releaseLock は終了時の解放を行う。
 //
 // Unlock は保持者でない場合に ErrNotLockHolder を返すため、「自分が保持者である場合に
-// 限り解放する」はこれで満たされる。consume されている場合（一括置き換えによって排他が
-// 解かれた場合）は、残っていた場合に限り解放するという意味になるため、ErrNotLockHolder を
-// 成功として扱う。
-func releaseLock(ctx context.Context, l Locker, h *hold) error {
-	err := l.Unlock(ctx)
-	if err == nil {
-		return nil
-	}
-	if h.isConsumed() && errors.Is(err, ErrNotLockHolder) {
-		return nil
-	}
-	return err
+// 限り解放する」はこれで満たされる（Locker の契約 第 4 節）。**解放の失敗はそのまま返る。**
+func releaseLock(ctx context.Context, l Locker) error {
+	return l.Unlock(ctx)
 }
 
 // renewIntervalOf は延長の間隔を返す。
@@ -310,13 +265,6 @@ func renewIntervalOf(l Locker, override time.Duration) time.Duration {
 		}
 	}
 	return DefaultRenewInterval
-}
-
-// consumesLockOnZoneApply は、ゾーン全体の一括置き換えがこの排他を解くかを返す。
-// 申告が無ければ解かれないものとして扱う。
-func consumesLockOnZoneApply(l Locker) bool {
-	c, ok := l.(zoneApplyConsumer)
-	return ok && c.consumedByZoneApply()
 }
 
 // renewLoop は保持期間を周期的に延長する。RunLocked の実行中のみ動く。

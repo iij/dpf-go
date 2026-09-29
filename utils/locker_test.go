@@ -183,52 +183,21 @@ func TestMutex_DeclaresRenewInterval(t *testing.T) {
 
 // ---- 消費の印 (T029・FR-009) ----
 
-func TestConsumesLockOnZoneApply(t *testing.T) {
-	s := newLockServer(map[string]string{}, 0)
-	c := newLockClient(t, s)
-
-	// 009 以降、排他の状態はゾーンのラベルにあり、レコードの一括更新とゾーン反映は
-	// これに影響しない。したがって既定の排他は「解かれる」と申告しない。
-	if consumesLockOnZoneApply(NewMutex(c.RecordsAPI, c.ZonesAPI, testZoneID)) {
-		t.Error("既定の排他が「一括置き換えで解かれる」と申告している。ゾーンのラベルは一括置き換えの対象ではない")
-	}
-	// 外部の仕組みを使う排他は申告できない（非公開のメソッドであるため）。
-	if consumesLockOnZoneApply(&fakeLocker{}) {
-		t.Error("外部の実装が申告できてしまっている")
-	}
-	if consumesLockOnZoneApply(&intervalLocker{}) {
-		t.Error("外部の実装が申告できてしまっている")
-	}
-}
-
 // 消費の印が立っている場合に限り、解放の「保持者でない」を成功として扱う。
-func TestRunLocked_ConsumedRelease(t *testing.T) {
-	cases := []struct {
-		name    string
-		consume bool
-		want    error
-	}{
-		{"消費の印があれば成功として扱う", true, nil},
-		{"印が無ければそのまま返す", false, ErrNotLockHolder},
+// 解放の失敗はそのまま返る。
+//
+// 010 より前は「一括置き換えが排他を解く」ことの印が立っている場合に限り、解放の
+// ErrNotLockHolder を成功として扱っていた。印の仕組みごと取り除いたため、**解放の失敗は
+// 例外なくそのまま返る**（specs/010-remove-apply-consume）。
+func TestRunLocked_ReleaseFailureIsReturned(t *testing.T) {
+	f := &fakeLocker{unlockErr: ErrNotLockHolder}
+	err := RunLocked(context.Background(), f, func(context.Context) error { return nil })
+	if !errors.Is(err, ErrNotLockHolder) {
+		t.Errorf("エラーが %v、期待は %v", err, ErrNotLockHolder)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := &fakeLocker{unlockErr: ErrNotLockHolder}
-			err := runLockedHold(context.Background(), f,
-				func(_ context.Context, h *hold) error {
-					if tc.consume {
-						h.consume()
-					}
-					return nil
-				})
-			if !errors.Is(err, tc.want) && err != tc.want {
-				t.Errorf("エラーが %v、期待は %v", err, tc.want)
-			}
-			// どちらの場合も解放は試みる（残っていれば解く）。
-			if n := f.unlockCount(); n != 1 {
-				t.Errorf("解放の回数が %d、期待は 1", n)
-			}
-		})
+	// 解放は試みる。
+	if n := f.unlockCount(); n != 1 {
+		t.Errorf("解放の回数が %d、期待は 1", n)
 	}
 }
 
