@@ -194,11 +194,11 @@ func (a *ZoneApplier) Apply(ctx context.Context, edit ZoneRecordsEditor, opts ..
 	}
 
 	// 省略の合図を nil へ変換するのは、この関数の**内側**でなければならない。
-	// runLockedHold は処理がエラーを返すと解放のエラーを捨て、排他を失っていた場合は
+	// RunLocked は処理がエラーを返すと解放のエラーを捨て、排他を失っていた場合は
 	// errors.Join で包んで返す。外側で変換すると、包まれた排他の喪失にも errors.Is が
 	// 一致してしまい、解放の失敗と排他の喪失がどちらも消える。
-	return runLockedHold(ctx, a.locker, func(ctx context.Context, h *hold) error {
-		err := a.apply(ctx, h, edit, cfg)
+	return RunLocked(ctx, a.locker, func(ctx context.Context) error {
+		err := a.apply(ctx, edit, cfg)
 		if errors.Is(err, ErrSkipApply) {
 			// 打ち切られていた場合は省略を成功にしない。省略の経路は API を 1 つも
 			// 呼ばないため、打ち切りが表面化する経路が他に無い。
@@ -212,7 +212,7 @@ func (a *ZoneApplier) Apply(ctx context.Context, edit ZoneRecordsEditor, opts ..
 }
 
 // apply は排他の保護下で行う本体。
-func (a *ZoneApplier) apply(ctx context.Context, h *hold, edit ZoneRecordsEditor, cfg *applyConfig) error {
+func (a *ZoneApplier) apply(ctx context.Context, edit ZoneRecordsEditor, cfg *applyConfig) error {
 	current, err := a.currents(ctx)
 	if err != nil {
 		return err
@@ -226,18 +226,6 @@ func (a *ZoneApplier) apply(ctx context.Context, h *hold, edit ZoneRecordsEditor
 		return ErrNoRecords
 	}
 	edited = fillRequiredRecords(edited, current)
-
-	// 一括置き換えが排他を解くと申告する実装では、自動延長を止め、終了時の無条件の
-	// 解放を行わないようにする。この位置より早いと編集中の延長が止まり、遅いと反映中に
-	// 延長が走ってしまう。
-	//
-	// **009 以降、この申告を行う実装は無い。** 既定の排他はゾーンのラベルを使い、
-	// レコードの一括更新とゾーン反映はゾーンのラベルに影響しない。申告は utils の外から
-	// 実装できない非公開の形であるため、現在この分岐へ入る経路は無い。008 で定めた抽象の
-	// 一部であり、削除は別の機能として扱う（specs/009-zone-label-lock/research.md D11）。
-	if consumesLockOnZoneApply(a.locker) {
-		h.consume()
-	}
 
 	body := dpf.PatchZoneAtomicChanges{
 		Records:             edited,

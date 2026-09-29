@@ -327,7 +327,7 @@ func TestZoneApplier_NoRenewAfterSkip(t *testing.T) {
 
 // 排他を失っていた場合、省略は成功にならない。
 //
-// 番兵を nil へ変換するのが runLockedHold の内側でなければならない理由を固定する。
+// 番兵を nil へ変換するのが RunLocked へ渡す関数の内側でなければならない理由を固定する。
 // 外側で変換すると、包まれた排他の喪失にも errors.Is が一致して消える。
 func TestZoneApplier_SkipApplyAfterLockLost(t *testing.T) {
 	s := applyServer(map[string]string{})
@@ -703,10 +703,5 @@ func TestNewZoneApplier_DefaultsToRecordMutex(t *testing.T) {
 	}
 	if mu.zoneID != testZoneID {
 		t.Errorf("排他のゾーンが %q、期待は %q", mu.zoneID, testZoneID)
-	}
-	// 009 以降、既定の排他はゾーンのラベルを使う。レコードの一括更新とゾーン反映は
-	// ゾーンのラベルに影響しないため、「解かれる」とは申告しない。
-	if consumesLockOnZoneApply(mu) {
-		t.Error("既定の排他が「一括置き換えで解かれる」と申告している")
 	}
 }
